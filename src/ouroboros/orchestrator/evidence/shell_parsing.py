@@ -243,6 +243,83 @@ def _strip_env_prefix(parts: list[str]) -> list[str]:
     return parts[index:]
 
 
+_DIRECT_TEST_RUNNERS = frozenset({"pytest", "py.test", "tox", "nox"})
+
+# ``uv run`` options that consume the following token as their value. Only
+# options listed here may swallow an argument; an unknown option is treated as
+# a flag, so ``uv run --unknown value pytest`` stops at ``value`` and is not
+# recognized as a test invocation. That keeps the widening conservative.
+_UV_RUN_VALUE_OPTIONS = frozenset(
+    {
+        "-p",
+        "-w",
+        "--python",
+        "--with",
+        "--with-editable",
+        "--with-requirements",
+        "--directory",
+        "--project",
+        "--package",
+        "--extra",
+        "--group",
+        "--index",
+        "--index-url",
+        "--extra-index-url",
+        "--find-links",
+        "--constraint",
+        "--override",
+        "--env-file",
+        "--config-file",
+        "--cache-dir",
+        "--color",
+        "--resolution",
+        "--prerelease",
+        "--python-preference",
+        "--refresh-package",
+        "--no-binary-package",
+        "--only-binary-package",
+    }
+)
+
+
+def _uv_run_runner_parts(parts: list[str]) -> list[str] | None:
+    """Return the argv that ``uv run`` executes, after uv's own options.
+
+    Runtime transcripts record real invocations such as
+    ``uv run --with pytest --no-project pytest``; the executed runner is the
+    first non-option token after ``uv run``. Returns ``None`` when the command
+    is not a ``uv run`` wrapper or when no runner token is reachable.
+    """
+    if len(parts) < 3 or parts[:2] != ["uv", "run"]:
+        return None
+    index = 2
+    while index < len(parts):
+        token = parts[index]
+        if not token.startswith("-"):
+            return parts[index:]
+        if "=" in token or token not in _UV_RUN_VALUE_OPTIONS:
+            index += 1
+            continue
+        index += 2
+    return None
+
+
+def _runner_parts_after_wrappers(parts: list[str]) -> list[str]:
+    """Return the argv slice whose head is the recognized test runner."""
+    uv_runner_parts = _uv_run_runner_parts(parts)
+    resolved = uv_runner_parts if uv_runner_parts is not None else parts
+    if (
+        len(resolved) >= 3
+        and _is_python_executable(resolved[0])
+        and resolved[1] == "-m"
+        and resolved[2] in {"pytest", "unittest"}
+    ):
+        return resolved[2:]
+    if resolved and resolved[0] in _DIRECT_TEST_RUNNERS:
+        return resolved
+    return []
+
+
 def _has_gradle_or_maven_test_skip(parts: list[str]) -> bool:
     """Return True when a Gradle/Maven command explicitly disables tests."""
 
@@ -350,18 +427,10 @@ def _test_invocation_from_prefix(command: str) -> str | None:
     if _has_non_executing_test_mode(parts):
         return None
 
-    if parts[0] in {"pytest", "py.test", "tox", "nox"}:
-        return _normalized_evidence_text(" ".join(parts))
     if len(parts) >= 2 and parts[0] in {"npm", "pnpm", "yarn"} and parts[1] == "test":
         return _normalized_evidence_text(" ".join(parts))
-    if len(parts) >= 3 and parts[:3] == ["uv", "run", "pytest"]:
-        return _normalized_evidence_text(" ".join(parts))
-    if (
-        len(parts) >= 3
-        and _is_python_executable(parts[0])
-        and parts[1] == "-m"
-        and parts[2] in {"pytest", "unittest"}
-    ):
+    runner_parts = _runner_parts_after_wrappers(parts)
+    if runner_parts and runner_parts[0] in {"pytest", "py.test", "tox", "nox", "unittest"}:
         return _normalized_evidence_text(" ".join(parts))
     executable = Path(parts[0]).name
     if (
@@ -396,16 +465,7 @@ def _has_non_executing_test_mode(parts: list[str]) -> bool:
     if any(part in _GENERIC_NON_EXECUTING_TEST_OPTIONS for part in parts[1:]):
         return True
 
-    runner_parts = parts
-    if len(parts) >= 3 and (
-        parts[:3] == ["uv", "run", "pytest"]
-        or (
-            _is_python_executable(parts[0])
-            and parts[1] == "-m"
-            and parts[2] in {"pytest", "unittest"}
-        )
-    ):
-        runner_parts = parts[2:]
+    runner_parts = _runner_parts_after_wrappers(parts) or parts
 
     runner = Path(runner_parts[0]).name if runner_parts else ""
     options = runner_parts[1:]

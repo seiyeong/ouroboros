@@ -80,6 +80,47 @@ def _tool_returned(
     )
 
 
+def _execution_tool_started(
+    *,
+    tool_call_id: str,
+    tool_name: str,
+    when: datetime | None = None,
+) -> BaseEvent:
+    return BaseEvent(
+        id=f"evt_start_{tool_call_id}",
+        type="execution.tool.started",
+        timestamp=when or datetime.now(UTC),
+        aggregate_type="execution",
+        aggregate_id="exec_1",
+        data={
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "execution_id": "exec_1",
+        },
+    )
+
+
+def _execution_tool_completed(
+    *,
+    tool_call_id: str,
+    tool_name: str,
+    when: datetime | None = None,
+    is_error: bool = False,
+) -> BaseEvent:
+    return BaseEvent(
+        id=f"evt_ret_{tool_call_id}",
+        type="execution.tool.completed",
+        timestamp=when or datetime.now(UTC),
+        aggregate_type="execution",
+        aggregate_id="exec_1",
+        data={
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "is_error": is_error,
+            "execution_id": "exec_1",
+        },
+    )
+
 def _llm_requested(
     *,
     call_id: str,
@@ -205,6 +246,39 @@ class TestToolProjection:
         assert len(result.steps) == 1
         step = result.steps[0]
         assert step.source_event_ids == ("evt_ret_orphan",)
+
+    def test_execution_runtime_tool_events_project_one_step(self) -> None:
+        start_time = datetime.now(UTC)
+        events = [
+            _execution_tool_started(
+                tool_call_id="rt1",
+                tool_name="Bash",
+                when=start_time,
+            ),
+            _execution_tool_completed(
+                tool_call_id="rt1",
+                tool_name="Bash",
+                when=start_time + timedelta(milliseconds=8),
+            ),
+        ]
+        result = build_projection(events, seed_id="seed_abc")
+        assert len(result.steps) == 1
+        step = result.steps[0]
+        assert step.kind is StepKind.SHELL_COMMAND
+        assert step.name == "Bash"
+        assert step.ok is True
+        assert step.source_event_ids == ("evt_start_rt1", "evt_ret_rt1")
+
+    def test_execution_runtime_tool_error_sets_ok_false(self) -> None:
+        events = [
+            _execution_tool_started(tool_call_id="rt2", tool_name="Edit"),
+            _execution_tool_completed(tool_call_id="rt2", tool_name="Edit", is_error=True),
+        ]
+        result = build_projection(events, seed_id="seed_abc")
+        assert len(result.steps) == 1
+        step = result.steps[0]
+        assert step.kind is StepKind.TOOL_CALL
+        assert step.ok is False
 
 
 class TestLLMProjection:

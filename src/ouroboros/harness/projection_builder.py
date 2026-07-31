@@ -52,8 +52,8 @@ from ouroboros.harness.projection import (
     VerdictRecord,
 )
 
-_TOOL_STARTED = "tool.call.started"
-_TOOL_RETURNED = "tool.call.returned"
+_TOOL_STARTED_TYPES = frozenset({"tool.call.started", "execution.tool.started"})
+_TOOL_RETURNED_TYPES = frozenset({"tool.call.returned", "execution.tool.completed"})
 _LLM_REQUESTED = "llm.call.requested"
 _LLM_RETURNED = "llm.call.returned"
 _ARTIFACT_RECORDED_TYPES = frozenset(
@@ -152,7 +152,7 @@ class ProjectionBuilder:
         self._update_timestamps(event)
         self._identity_events.append(event)
 
-        if event.type == _TOOL_STARTED:
+        if event.type in _TOOL_STARTED_TYPES:
             call_id = _extract_call_id(event)
             if call_id is not None:
                 self._tool_started[call_id] = event
@@ -167,7 +167,7 @@ class ProjectionBuilder:
                 )
             return self
 
-        if event.type == _TOOL_RETURNED:
+        if event.type in _TOOL_RETURNED_TYPES:
             self._handle_tool_returned(event)
             return self
 
@@ -403,9 +403,10 @@ def build_projection(
 def _extract_call_id(event: BaseEvent) -> str | None:
     if not isinstance(event.data, dict):
         return None
-    value = event.data.get("call_id")
-    if isinstance(value, str) and value.strip():
-        return value.strip()
+    for key in ("call_id", "tool_call_id"):
+        value = event.data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return None
 
 

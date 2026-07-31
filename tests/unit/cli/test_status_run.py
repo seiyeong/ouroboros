@@ -12,15 +12,21 @@ These tests pin the contract that the CLI is a thin wrapper over
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import json
+from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from typer.testing import CliRunner
 
 from ouroboros.cli.main import app
 from ouroboros.core.types import Result
+from ouroboros.events.base import BaseEvent
 from ouroboros.mcp.errors import MCPToolError
+from ouroboros.mcp.tools.projection_handlers import ProjectionQueryHandler
 from ouroboros.mcp.types import ContentType, MCPContentItem, MCPToolResult
+from ouroboros.persistence.event_store import EventStore
 
 runner = CliRunner(env={"COLUMNS": "240"})
 
@@ -198,3 +204,96 @@ def test_status_run_session_id_only_still_supported() -> None:
 
     assert result.exit_code == 0
     assert handler.last_arguments == {"session_id": "session_legacy"}
+
+
+def _runtime_tool_events(session_id: str) -> tuple[BaseEvent, ...]:
+    started = datetime.now(UTC)
+    return (
+        BaseEvent(
+            id="evt_exec_start",
+            type="execution.tool.started",
+            timestamp=started,
+            aggregate_type="execution",
+            aggregate_id="exec_projected",
+            data={
+                "execution_id": "exec_projected",
+                "session_id": session_id,
+                "tool_call_id": "call_1",
+                "tool_name": "Bash",
+            },
+        ),
+        BaseEvent(
+            id="evt_exec_done",
+            type="execution.tool.completed",
+            timestamp=started,
+            aggregate_type="execution",
+            aggregate_id="exec_projected",
+            data={
+                "execution_id": "exec_projected",
+                "session_id": session_id,
+                "tool_call_id": "call_1",
+                "tool_name": "Bash",
+                "is_error": False,
+            },
+        ),
+    )
+
+
+def _session_started_event(session_id: str) -> BaseEvent:
+    return BaseEvent(
+        id=f"evt_session_{session_id}",
+        type="orchestrator.session.started",
+        timestamp=datetime.now(UTC),
+        aggregate_type="session",
+        aggregate_id=session_id,
+        data={
+            "execution_id": "exec_projected",
+            "seed_id": "seed_from_session",
+            "seed_goal": "Ship the hello world script",
+        },
+    )
+
+
+async def _projection_meta_for(tmp_path: Path, events: tuple[BaseEvent, ...]) -> dict:
+    store = EventStore(f"sqlite+aiosqlite:///{tmp_path / 'events.db'}")
+    await store.initialize()
+    try:
+        for event in events:
+            await store.append(event)
+        result = await ProjectionQueryHandler(event_store=store).handle(
+            {"execution_id": "exec_projected"}
+        )
+    finally:
+        await store.close()
+    return result.unwrap().meta
+
+
+@pytest.mark.asyncio
+async def test_execution_projection_uses_session_goal_and_seed_id(tmp_path: Path) -> None:
+    events = (*_runtime_tool_events("orch_single"), _session_started_event("orch_single"))
+
+    meta = await _projection_meta_for(tmp_path, events)
+
+    assert meta["seed_id"] == "seed_from_session"
+    assert meta["seed_id_source"] == "session"
+    assert meta["run"]["goal"] == "Ship the hello world script"
+    assert len(meta["steps"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_execution_projection_keeps_fallback_for_multiple_sessions(tmp_path: Path) -> None:
+    events = (
+        *_runtime_tool_events("orch_one"),
+        *(
+            event.model_copy(update={"id": f"{event.id}_b"})
+            for event in _runtime_tool_events("orch_two")
+        ),
+        _session_started_event("orch_one"),
+        _session_started_event("orch_two"),
+    )
+
+    meta = await _projection_meta_for(tmp_path, events)
+
+    assert meta["seed_id"] == "exec_projected"
+    assert meta["seed_id_source"] == "fallback"
+    assert meta["run"]["goal"] == ""

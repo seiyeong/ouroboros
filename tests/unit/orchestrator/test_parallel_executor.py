@@ -2986,6 +2986,85 @@ def test_legacy_ac_verifier_keeps_strict_formal_runner_tests_passed() -> None:
     assert accepted.passed is True, accepted.reasons
 
 
+def _uv_pytest_messages(command: str) -> tuple[AgentMessage, ...]:
+    return (
+        AgentMessage(
+            type="tool",
+            content="edit",
+            tool_name="Edit",
+            data={
+                "subtype": "success",
+                "runtime_event_type": "tool.completed",
+                "tool_input": {"file_path": "/private/tmp/ooo-repro-blos/src/mod.py"},
+            },
+        ),
+        AgentMessage(
+            type="tool_result",
+            content="updated",
+            tool_name="Edit",
+            data={"subtype": "tool_result", "is_error": False},
+        ),
+        AgentMessage(
+            type="tool",
+            content="pytest",
+            tool_name="Bash",
+            data={
+                "tool_input": {"command": command},
+                "exit_code": 0,
+                "output": "1 passed in 0.01s",
+            },
+        ),
+        AgentMessage(type="result", content="done", data={}),
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "uv run --with pytest pytest",
+        "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. uv run --with pytest --no-project pytest",
+    ],
+)
+def test_uv_run_with_options_backs_tests_passed(command: str) -> None:
+    executor = _file_scope_executor("/private/tmp/ooo-repro-blos")
+
+    verdict = executor._verify_atomic_evidence_against_runtime_messages(
+        messages=_uv_pytest_messages(command),
+        typed_evidence=EvidenceRecord(
+            data={
+                "files_touched": ["src/mod.py"],
+                "commands_run": [command],
+                "tests_passed": [command],
+            }
+        ),
+        ac_content="Implement src/mod.py and run pytest.",
+        has_success_contract=False,
+    )
+
+    assert verdict.passed is True, verdict.reasons
+
+
+def test_uv_run_collect_only_does_not_back_tests_passed() -> None:
+    executor = _file_scope_executor("/private/tmp/ooo-repro-blos")
+    command = "uv run --with pytest pytest --collect-only"
+
+    verdict = executor._verify_atomic_evidence_against_runtime_messages(
+        messages=_uv_pytest_messages(command),
+        typed_evidence=EvidenceRecord(
+            data={
+                "files_touched": ["src/mod.py"],
+                "commands_run": [command],
+                "tests_passed": [command],
+            }
+        ),
+        ac_content="Implement src/mod.py and run pytest.",
+        has_success_contract=False,
+    )
+
+    assert verdict.passed is False
+    assert "tests_passed:" in verdict.reasons[0]
+
+
 @pytest.mark.asyncio
 async def test_verify_gate_flips_contract_ac_to_failed_when_declared_command_fails(
     tmp_path,

@@ -170,6 +170,14 @@ class ProjectionQueryHandler:
                 override=seed_id_override,
             )
             goal = _derive_goal(ordered_events)
+            if seed_id_source == "fallback" or not goal:
+                session_events = await _session_origin_events(store, ordered_events)
+                if seed_id_source == "fallback":
+                    derived_seed_id = _derive_seed_id(session_events)
+                    if derived_seed_id is not None:
+                        seed_id, seed_id_source = derived_seed_id, "session"
+                if not goal:
+                    goal = _derive_goal(session_events)
             projection = build_projection(
                 ordered_events,
                 seed_id=seed_id,
@@ -212,6 +220,27 @@ class ProjectionQueryHandler:
         finally:
             if owns_event_store and store is not None:
                 await store.close()
+
+
+async def _session_origin_events(
+    store: EventStore,
+    events: Sequence[BaseEvent],
+) -> tuple[BaseEvent, ...]:
+    session_ids = {
+        value.strip()
+        for event in events
+        if isinstance(event.data, dict)
+        for value in (event.data.get("session_id"),)
+        if isinstance(value, str) and value.strip().startswith("orch_")
+    }
+    if len(session_ids) != 1:
+        return ()
+    origin_events = await store.query_events(
+        aggregate_id=next(iter(session_ids)),
+        event_type="orchestrator.session.started",
+        limit=1,
+    )
+    return tuple(origin_events)
 
 
 async def _load_projection_events(
