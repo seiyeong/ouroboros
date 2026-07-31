@@ -257,6 +257,19 @@ def _run_only_verification_meta(session_id: str | None) -> dict[str, Any]:
     }
 
 
+def _execution_completion_message(result_meta: Mapping[str, Any]) -> str:
+    if (
+        result_meta.get("evaluation_status") == "approved"
+        and result_meta.get("final_approved") is True
+    ):
+        return "Execution complete; formal evaluation approved"
+    if result_meta.get("evaluation_status") == "enqueued":
+        return "Execution complete; formal evaluation enqueued"
+    if result_meta.get("evaluation_status") == "enqueue_failed":
+        return "Execution complete; formal evaluation enqueue failed"
+    return "Execution complete; formal evaluation not run"
+
+
 def _execution_completed_job_event(
     job_id: str,
     result_text: str,
@@ -271,7 +284,7 @@ def _execution_completed_job_event(
         aggregate_id=job_id,
         data={
             "status": JobStatus.COMPLETED.value,
-            "message": "Execution complete; formal evaluation not run",
+            "message": _execution_completion_message(_run_only_verification_meta(session_id)),
             "result_text": result_text,
             "result_meta": {
                 "completed_from_execution_terminal": True,
@@ -740,18 +753,26 @@ class JobManager:
                 elif job_id in self._monitor_terminalized_jobs:
                     completed_result = await self._derive_completed_execution_result(snapshot)
                     if completed_result is not None:
+                        completion_text = completed_result
+                        runner_text = getattr(result, "text_content", None)
+                        if snapshot.links.preserve_runner_result and isinstance(runner_text, str):
+                            completion_text = runner_text or completed_result
                         await self._append_execution_completed_event_with_fallback(
                             job_id,
-                            completed_result,
+                            completion_text,
                             result_meta=result_meta if isinstance(result_meta, dict) else None,
                         )
                         return
                 else:
                     completed_result = await self._derive_completed_execution_result(snapshot)
                     if completed_result is not None:
+                        completion_text = completed_result
+                        runner_text = getattr(result, "text_content", None)
+                        if snapshot.links.preserve_runner_result and isinstance(runner_text, str):
+                            completion_text = runner_text or completed_result
                         await self._append_execution_completed_event_with_fallback(
                             job_id,
-                            completed_result,
+                            completion_text,
                             result_meta=result_meta if isinstance(result_meta, dict) else None,
                         )
                         return
@@ -1052,11 +1073,13 @@ class JobManager:
         if result_meta:
             merged_meta.update(_safe_meta(result_meta))
             merged_meta["completed_from_execution_terminal"] = True
-        message = "Execution complete; formal evaluation not run"
-        if merged_meta.get("evaluation_status") == "enqueued":
-            message = "Execution complete; formal evaluation enqueued"
-        elif merged_meta.get("evaluation_status") == "enqueue_failed":
-            message = "Execution complete; formal evaluation enqueue failed"
+        if (
+            merged_meta.get("evaluation_status") == "approved"
+            and merged_meta.get("final_approved") is True
+        ):
+            merged_meta.pop("next_step", None)
+            merged_meta.pop("manual_retry_next_step", None)
+        message = _execution_completion_message(merged_meta)
         await self._append_event(
             "mcp.job.completed",
             job_id,
@@ -1093,7 +1116,7 @@ class JobManager:
                 original_event_type="mcp.job.completed",
                 original_data={
                     "status": JobStatus.COMPLETED.value,
-                    "message": "Execution complete; formal evaluation not run",
+                    "message": _execution_completion_message(result_meta or {}),
                     "result_text": result_text,
                     "result_meta": result_meta or {},
                     "is_error": False,
@@ -2055,6 +2078,7 @@ class JobManager:
         snapshot = await self._recover_linked_execution_terminal_snapshot(
             snapshot,
             owner_is_dead=owner_is_dead,
+            owner_identity_known=owner_pid is not None,
         )
         snapshot = await self._reconcile_orphaned_job_snapshot(
             snapshot,
@@ -2068,15 +2092,20 @@ class JobManager:
         snapshot: JobSnapshot,
         *,
         owner_is_dead: bool = False,
+        owner_identity_known: bool = False,
     ) -> JobSnapshot:
-        """Recover linked execution terminal jobs when no live runner remains.
+        """Recover linked execution terminal jobs after their owner has exited.
 
         Live jobs keep the existing JobManager invariant: terminal job state is
         emitted by the runner-owned path after the runner exits or cooperates
-        with cancellation. After process restart, however, there is no live
-        runner left to write that event; if the linked execution already has
-        authoritative terminal evidence, materialize the job terminal event
-        from that durable evidence.
+        with cancellation. A reader in another manager cannot infer whether the
+        recorded owner is still carrying post-execution continuation work, so it
+        must not materialize a terminal result while that owner may be alive.
+        After the owner has exited, a non-preserved runner can recover from
+        durable execution evidence. Legacy jobs without owner identity retain
+        their historical restart recovery. Jobs that preserve their runner
+        result keep completed continuation results authoritative and are left
+        for orphan recovery to fail loud if that owner died before publishing it.
         """
         if (
             snapshot.is_terminal
@@ -2086,7 +2115,11 @@ class JobManager:
             or snapshot.job_id in self._runner_tasks
         ):
             return snapshot
+        if owner_identity_known and not owner_is_dead:
+            return snapshot
         completed_result = await self._derive_completed_execution_result(snapshot)
+        if completed_result is not None and snapshot.links.preserve_runner_result:
+            return snapshot
         progress_blocker = (
             None
             if completed_result is not None

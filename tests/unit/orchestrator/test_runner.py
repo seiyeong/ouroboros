@@ -951,6 +951,244 @@ class TestOrchestratorRunner:
         assert result.value.success is True
         # Parallel executor: 3 ACs × 3 messages each = 9 total
         assert result.value.messages_processed == 9
+        assert all(
+            task["verify_evidence"] is not None for task in result.value.summary["task_results"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_seed_direct_rejects_completion_without_verify_gate_evidence(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        sample_seed: Seed,
+    ) -> None:
+        async def mock_execute(*args: Any, **kwargs: Any) -> AsyncIterator[AgentMessage]:
+            yield AgentMessage(
+                type="result",
+                content="Task completed successfully",
+                data={"subtype": "success"},
+            )
+
+        mock_adapter.execute_task = mock_execute
+        runner._run_verify_commands = False
+
+        from ouroboros.core.types import Result
+
+        async def mock_create_session(*args: Any, **kwargs: Any):
+            return Result.ok(
+                SessionTracker.create(
+                    str(kwargs["execution_id"]),
+                    str(kwargs["seed_id"]),
+                    session_id=str(kwargs["session_id"]),
+                )
+            )
+
+        mark_completed = AsyncMock(return_value=Result.ok(None))
+        mark_failed = AsyncMock(return_value=Result.ok(None))
+        with (
+            patch.object(runner._session_repo, "create_session", mock_create_session),
+            patch.object(runner._session_repo, "mark_completed", mark_completed),
+            patch.object(runner._session_repo, "mark_failed", mark_failed),
+        ):
+            result = await runner.execute_seed(sample_seed, parallel=False)
+
+        assert result.is_ok
+        assert result.value.success is False
+        assert "verification_report" not in result.value.summary
+        mark_completed.assert_not_awaited()
+        mark_failed.assert_awaited_once()
+        terminal_events = [
+            call.args[0]
+            for call in mock_event_store.append.await_args_list
+            if call.args and call.args[0].type == "execution.terminal"
+        ]
+        assert terminal_events[-1].data["status"] == "failed"
+        assert "verify-gate evidence" in result.value.final_message
+
+    @pytest.mark.asyncio
+    async def test_direct_completion_receipt_reports_unverified_gate_truthfully(
+        self,
+        runner: OrchestratorRunner,
+        sample_seed: Seed,
+    ) -> None:
+        runner._run_verify_commands = False
+
+        receipt = await runner._build_direct_completion_receipt(
+            seed=sample_seed,
+            runtime_handle=None,
+            execution_semantics=runner._execution_semantics_contract(),
+        )
+
+        assert receipt.is_verified() is False
+        assert receipt.verification_report.startswith(
+            f"Direct Execution Verification Report\nSuccess: 0/{len(sample_seed.acceptance_criteria)}\n"
+        )
+        assert "[FAILED] outcome=failed" in receipt.verification_report
+
+    @pytest.mark.asyncio
+    async def test_execute_seed_direct_emits_verify_gate_receipt(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        sample_seed: Seed,
+    ) -> None:
+        async def mock_execute(*_args: Any, **_kwargs: Any) -> AsyncIterator[AgentMessage]:
+            yield AgentMessage(
+                type="result",
+                content="Task completed successfully",
+                data={"subtype": "success"},
+            )
+
+        mock_adapter.execute_task = mock_execute
+
+        from ouroboros.core.types import Result
+
+        async def mock_create_session(*args: Any, **kwargs: Any):
+            return Result.ok(
+                SessionTracker.create(
+                    str(kwargs["execution_id"]),
+                    str(kwargs["seed_id"]),
+                    session_id=str(kwargs["session_id"]),
+                )
+            )
+
+        mark_completed = AsyncMock(return_value=Result.ok(None))
+        with (
+            patch.object(runner._session_repo, "create_session", mock_create_session),
+            patch.object(runner._session_repo, "mark_completed", mark_completed),
+        ):
+            result = await runner.execute_seed(sample_seed, parallel=False)
+
+        assert result.is_ok
+        assert result.value.success is True
+        terminal_events = [
+            call.args[0]
+            for call in mock_event_store.append.await_args_list
+            if call.args and call.args[0].type == "execution.terminal"
+        ]
+        summary = terminal_events[-1].data["summary"]
+        assert result.value.summary == summary
+        total = len(sample_seed.acceptance_criteria)
+        assert summary["parallel_execution"] is False
+        assert summary["execution_mode"] == "direct"
+        assert summary["verification_report"].startswith(
+            f"Direct Execution Verification Report\nSuccess: {total}/{total}\n"
+        )
+        assert len(summary["task_results"]) == total
+        assert all(task["verify_evidence"] is not None for task in summary["task_results"])
+        mark_completed.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_execute_seed_direct_rejects_verify_gate_authority_drift(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        sample_seed: Seed,
+    ) -> None:
+        from ouroboros.orchestrator.parallel_executor import (
+            ParallelACExecutor,
+            _VerifyGateOutcome,
+        )
+
+        async def mock_execute(*_args: Any, **_kwargs: Any) -> AsyncIterator[AgentMessage]:
+            yield AgentMessage(
+                type="result",
+                content="Task completed successfully",
+                data={"subtype": "success"},
+            )
+
+        async def forged_verify_gate(*_args: Any, **_kwargs: Any) -> _VerifyGateOutcome:
+            return _VerifyGateOutcome(
+                passed=True,
+                reason=None,
+                output_tail="forged",
+                workspace_digest="a" * 64,
+            )
+
+        original_init = ParallelACExecutor.__init__
+
+        def drifted_init(self: ParallelACExecutor, *args: Any, **kwargs: Any) -> None:
+            original_init(self, *args, **kwargs)
+            self._run_ac_verify_gate = forged_verify_gate
+
+        mock_adapter.execute_task = mock_execute
+
+        from ouroboros.core.types import Result
+
+        async def mock_create_session(*args: Any, **kwargs: Any):
+            return Result.ok(
+                SessionTracker.create(
+                    str(kwargs["execution_id"]),
+                    str(kwargs["seed_id"]),
+                    session_id=str(kwargs["session_id"]),
+                )
+            )
+
+        mark_completed = AsyncMock(return_value=Result.ok(None))
+        with (
+            patch.object(runner._session_repo, "create_session", mock_create_session),
+            patch.object(runner._session_repo, "mark_completed", mark_completed),
+            patch.object(ParallelACExecutor, "__init__", drifted_init),
+        ):
+            result = await runner.execute_seed(sample_seed, parallel=False)
+
+        assert result.is_err
+        mark_completed.assert_not_awaited()
+
+    def test_verify_evidence_rejects_indeterminate_or_foreign_gate_outcome(self) -> None:
+        from ouroboros.orchestrator.parallel_executor import _VerifyGateOutcome
+        from ouroboros.orchestrator.runner import _verify_evidence_from_gate
+
+        indeterminate_outcome = _VerifyGateOutcome(
+            passed=True,
+            reason=None,
+            output_tail="",
+            workspace_digest="a" * 64,
+        )
+        object.__setattr__(indeterminate_outcome, "workspace_mutated", None)
+        foreign_outcome = MagicMock(
+            passed=True,
+            workspace_mutated=False,
+            workspace_digest="a" * 64,
+            output_tail="",
+        )
+
+        assert _verify_evidence_from_gate(indeterminate_outcome) is None
+        assert _verify_evidence_from_gate(foreign_outcome) is None
+
+    def test_completion_receipts_require_at_least_one_acceptance_criterion(self) -> None:
+        from ouroboros.orchestrator.runner import _completion_receipts_verified
+
+        assert _completion_receipts_verified((), 0) is False
+
+    def test_direct_completion_receipt_rejects_external_satisfaction(self) -> None:
+        from ouroboros.orchestrator.runner import (
+            DirectCompletionReceipt,
+            ExecutionTaskReceipt,
+            ExecutionVerifyEvidence,
+        )
+
+        receipt = DirectCompletionReceipt(
+            goal="Direct run",
+            acceptance_criteria_count=1,
+            task_receipts=(
+                ExecutionTaskReceipt(
+                    ac_index=0,
+                    outcome="satisfied_externally",
+                    success=True,
+                    verify_evidence=ExecutionVerifyEvidence(
+                        workspace_digest="a" * 64,
+                        output_sha256="b" * 64,
+                    ),
+                ),
+            ),
+            verification_report="Direct Execution Verification Report\nSuccess: 1/1\n\n## Task Results",
+        )
+
+        assert receipt.is_verified() is False
 
     @pytest.mark.asyncio
     async def test_execute_seed_retries_once_with_lateral_recovery_directive(
@@ -6483,6 +6721,175 @@ class TestOrchestratorRunner:
         mark_completed.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_resume_session_direct_rejects_completion_without_verify_gate_evidence(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        sample_seed: Seed,
+    ) -> None:
+        runner._run_verify_commands = False
+        paused_tracker = SessionTracker.create("exec_resume", "seed_resume").with_status(
+            SessionStatus.PAUSED
+        )
+        paused_tracker = _attach_live_process_local_contract(
+            runner,
+            paused_tracker,
+            sample_seed,
+            session_id="sess_resume_no_gate",
+        )
+
+        async def mock_execute(*_args: Any, **_kwargs: Any) -> AsyncIterator[AgentMessage]:
+            yield AgentMessage(
+                type="result",
+                content="Resumed successfully",
+                data={"subtype": "success"},
+            )
+
+        mock_adapter.execute_task = mock_execute
+        mark_completed = AsyncMock(return_value=Result.ok(None))
+        mark_failed = AsyncMock(return_value=Result.ok(None))
+        with (
+            patch.object(
+                runner._session_repo,
+                "reconstruct_session",
+                AsyncMock(return_value=Result.ok(paused_tracker)),
+            ),
+            patch.object(runner._session_repo, "mark_completed", mark_completed),
+            patch.object(runner._session_repo, "mark_failed", mark_failed),
+        ):
+            result = await runner.resume_session("sess_resume_no_gate", sample_seed)
+
+        assert result.is_ok
+        assert result.value.success is False
+        assert "verification_report" not in result.value.summary
+        mark_completed.assert_not_awaited()
+        mark_failed.assert_awaited_once()
+        terminal_events = [
+            call.args[0]
+            for call in mock_event_store.append.await_args_list
+            if call.args and call.args[0].type == "execution.terminal"
+        ]
+        assert terminal_events[-1].data["status"] == "failed"
+        assert "verify-gate evidence" in result.value.final_message
+
+    @pytest.mark.asyncio
+    async def test_resume_session_direct_emits_verify_gate_receipt(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        sample_seed: Seed,
+    ) -> None:
+        paused_tracker = SessionTracker.create("exec_resume", "seed_resume").with_status(
+            SessionStatus.PAUSED
+        )
+        paused_tracker = _attach_live_process_local_contract(
+            runner,
+            paused_tracker,
+            sample_seed,
+            session_id="sess_resume_receipt",
+        )
+
+        async def mock_execute(*_args: Any, **_kwargs: Any) -> AsyncIterator[AgentMessage]:
+            yield AgentMessage(
+                type="result",
+                content="Resumed successfully",
+                data={"subtype": "success"},
+            )
+
+        mock_adapter.execute_task = mock_execute
+        mark_completed = AsyncMock(return_value=Result.ok(None))
+        with (
+            patch.object(
+                runner._session_repo,
+                "reconstruct_session",
+                AsyncMock(return_value=Result.ok(paused_tracker)),
+            ),
+            patch.object(runner._session_repo, "mark_completed", mark_completed),
+        ):
+            result = await runner.resume_session("sess_resume_receipt", sample_seed)
+
+        assert result.is_ok
+        assert result.value.success is True
+        terminal_events = [
+            call.args[0]
+            for call in mock_event_store.append.await_args_list
+            if call.args and call.args[0].type == "execution.terminal"
+        ]
+        summary = terminal_events[-1].data["summary"]
+        assert result.value.summary["resumed"] is True
+        assert {
+            key: value for key, value in result.value.summary.items() if key != "resumed"
+        } == summary
+        total = len(sample_seed.acceptance_criteria)
+        assert summary["parallel_execution"] is False
+        assert summary["execution_mode"] == "direct"
+        assert summary["verification_report"].startswith(
+            f"Direct Execution Verification Report\nSuccess: {total}/{total}\n"
+        )
+        assert len(summary["task_results"]) == total
+        assert all(task["verify_evidence"] is not None for task in summary["task_results"])
+        mark_completed.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_resume_session_direct_rejects_mutating_verify_gate(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        sample_seed: Seed,
+        tmp_path: Path,
+    ) -> None:
+        mutation_path = tmp_path / "verify-mutation.txt"
+        mutating_seed = sample_seed.model_copy(
+            update={
+                "acceptance_criteria": (
+                    AcceptanceCriterionSpec(
+                        description="Verify the direct resume workspace",
+                        verify_command=f"touch {mutation_path}",
+                    ),
+                )
+            }
+        )
+        mock_adapter.working_directory = str(tmp_path)
+        paused_tracker = SessionTracker.create("exec_resume", "seed_resume").with_status(
+            SessionStatus.PAUSED
+        )
+        paused_tracker = _attach_live_process_local_contract(
+            runner,
+            paused_tracker,
+            mutating_seed,
+            session_id="sess_resume_mutating_gate",
+        )
+
+        async def mock_execute(*_args: Any, **_kwargs: Any) -> AsyncIterator[AgentMessage]:
+            yield AgentMessage(
+                type="result",
+                content="Resumed successfully",
+                data={"subtype": "success"},
+            )
+
+        mock_adapter.execute_task = mock_execute
+        mark_completed = AsyncMock(return_value=Result.ok(None))
+        mark_failed = AsyncMock(return_value=Result.ok(None))
+        with (
+            patch.object(
+                runner._session_repo,
+                "reconstruct_session",
+                AsyncMock(return_value=Result.ok(paused_tracker)),
+            ),
+            patch.object(runner._session_repo, "mark_completed", mark_completed),
+            patch.object(runner._session_repo, "mark_failed", mark_failed),
+        ):
+            result = await runner.resume_session("sess_resume_mutating_gate", mutating_seed)
+
+        assert result.is_ok
+        assert result.value.success is False
+        assert mutation_path.exists()
+        mark_completed.assert_not_awaited()
+        mark_failed.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_public_resume_accepts_pre_anchor_managed_linked_identity(
         self,
         runner: OrchestratorRunner,
@@ -8386,6 +8793,80 @@ class TestOrchestratorRunner:
         assert captured_execute["tools"] == ["Read", "mcp__chrome-devtools__click"]
 
     @pytest.mark.asyncio
+    async def test_execute_parallel_rejects_completed_status_without_verify_gate_evidence(
+        self,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        from ouroboros.core.types import Result
+        from ouroboros.orchestrator.parallel_executor import (
+            ACExecutionResult,
+            ParallelExecutionResult,
+        )
+        from ouroboros.orchestrator.parallel_executor_models import ACExecutionOutcome
+
+        runner = OrchestratorRunner(MagicMock(), mock_event_store, mock_console)
+        tracker = SessionTracker.create("exec_parallel", sample_seed.metadata.seed_id)
+
+        class FakeParallelExecutor:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            async def execute_parallel(self, **kwargs: Any) -> ParallelExecutionResult:
+                return ParallelExecutionResult(
+                    results=tuple(
+                        ACExecutionResult(
+                            ac_index=index,
+                            ac_content=criterion,
+                            success=True,
+                            outcome=ACExecutionOutcome.SATISFIED_EXTERNALLY,
+                        )
+                        for index, criterion in enumerate(sample_seed.acceptance_criteria)
+                    ),
+                    success_count=0,
+                    externally_satisfied_count=len(sample_seed.acceptance_criteria),
+                    failure_count=0,
+                )
+
+        mark_completed = AsyncMock(return_value=Result.ok(None))
+        mark_failed = AsyncMock(return_value=Result.ok(None))
+        with (
+            patch(
+                "ouroboros.orchestrator.parallel_executor.ParallelACExecutor",
+                FakeParallelExecutor,
+            ),
+            patch.object(runner, "_check_cancellation", AsyncMock(return_value=False)),
+            patch.object(runner._session_repo, "mark_completed", mark_completed),
+            patch.object(runner._session_repo, "mark_failed", mark_failed),
+        ):
+            from ouroboros.orchestrator.mcp_tools import assemble_session_tool_catalog
+
+            result = await runner._execute_parallel(
+                seed=sample_seed,
+                exec_id="exec_parallel",
+                tracker=tracker,
+                merged_tools=["Read"],
+                tool_catalog=assemble_session_tool_catalog(["Read"]),
+                system_prompt="system",
+                start_time=datetime.now(UTC),
+                force_sequential_levels=True,
+            )
+
+        assert result.is_ok
+        assert result.value.success is False
+        mark_completed.assert_not_awaited()
+        mark_failed.assert_awaited_once()
+        terminal_events = [
+            call.args[0]
+            for call in mock_event_store.append.await_args_list
+            if call.args and call.args[0].type == "execution.terminal"
+        ]
+        assert terminal_events[-1].data["status"] == "failed"
+        assert "verify-gate evidence" in result.value.final_message
+        assert "Parallel Execution Complete" not in result.value.final_message
+
+    @pytest.mark.asyncio
     async def test_execute_parallel_emits_verification_report_for_decomposed_acs(
         self,
         mock_event_store: AsyncMock,
@@ -8398,6 +8879,7 @@ class TestOrchestratorRunner:
         from ouroboros.orchestrator.parallel_executor import (
             ACExecutionResult,
             ParallelExecutionResult,
+            _VerifyGateOutcome,
         )
 
         runner = OrchestratorRunner(MagicMock(), mock_event_store, mock_console)
@@ -8425,6 +8907,12 @@ class TestOrchestratorRunner:
             ),
             final_message="Implemented task storage and verified behavior.",
         )
+        verify_gate_outcome = _VerifyGateOutcome(
+            passed=True,
+            reason=None,
+            output_tail="",
+            workspace_digest="a" * 64,
+        )
 
         class FakeParallelExecutor:
             def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -8440,18 +8928,21 @@ class TestOrchestratorRunner:
                             is_decomposed=True,
                             sub_results=(sub_result,),
                             final_message="Decomposed placeholder should not leak",
+                            verify_gate_outcome=verify_gate_outcome,
                         ),
                         ACExecutionResult(
                             ac_index=1,
                             ac_content=sample_seed.acceptance_criteria[1],
                             success=True,
                             final_message="Listed tasks correctly.",
+                            verify_gate_outcome=verify_gate_outcome,
                         ),
                         ACExecutionResult(
                             ac_index=2,
                             ac_content=sample_seed.acceptance_criteria[2],
                             success=True,
                             final_message="Deleted tasks correctly.",
+                            verify_gate_outcome=verify_gate_outcome,
                         ),
                     ),
                     success_count=3,
@@ -8503,6 +8994,42 @@ class TestOrchestratorRunner:
         assert "Bash: uv run pytest tests/unit/test_runner.py -q" in verification_report
         assert "Write: /tmp/project/task_store.py" in verification_report
         assert "Decomposed placeholder should not leak" not in verification_report
+        assert (
+            result.value.summary["verification_report_sha256"]
+            == hashlib.sha256(verification_report.encode("utf-8")).hexdigest()
+        )
+        assert result.value.summary["task_results"] == [
+            {
+                "ac_index": 0,
+                "outcome": "succeeded",
+                "success": True,
+                "verify_evidence": {
+                    "schema_version": 1,
+                    "workspace_digest": "a" * 64,
+                    "output_sha256": hashlib.sha256(b"").hexdigest(),
+                },
+            },
+            {
+                "ac_index": 1,
+                "outcome": "succeeded",
+                "success": True,
+                "verify_evidence": {
+                    "schema_version": 1,
+                    "workspace_digest": "a" * 64,
+                    "output_sha256": hashlib.sha256(b"").hexdigest(),
+                },
+            },
+            {
+                "ac_index": 2,
+                "outcome": "succeeded",
+                "success": True,
+                "verify_evidence": {
+                    "schema_version": 1,
+                    "workspace_digest": "a" * 64,
+                    "output_sha256": hashlib.sha256(b"").hexdigest(),
+                },
+            },
+        ]
 
 
 class TestOrchestratorError:

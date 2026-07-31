@@ -1607,6 +1607,12 @@ class TestLiveRunPathsTriggerProof:
                     ac_content=seed.acceptance_criteria[0],
                     success=True,
                     final_message="done",
+                    verify_gate_outcome=pe_module._VerifyGateOutcome(
+                        passed=True,
+                        reason=None,
+                        output_tail="",
+                        workspace_digest="a" * 64,
+                    ),
                 ),
             ),
             success_count=1,

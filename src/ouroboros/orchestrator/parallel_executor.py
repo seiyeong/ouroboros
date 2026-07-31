@@ -4417,23 +4417,23 @@ class ParallelACExecutor:
                     reason = metadata.get("reason")
                     commit = metadata.get("commit")
 
-                    # PR-V V4: --skip-completed trusts working-tree state. When the
-                    # AC carries a success contract (verify_command OR expected
-                    # artifacts), prove it with the gate before skipping; on gate
-                    # failure, execute the AC normally instead.
                     spec = seed.acceptance_criteria[ac_idx]
                     verification_status = "assumed"
                     gate: _VerifyGateOutcome | None = None
-                    if (
-                        self._run_verify_commands
-                        and isinstance(spec, AcceptanceCriterionSpec)
-                        and (spec.verify_command or spec.expected_artifacts)
-                    ):
+                    verification_spec = (
+                        spec
+                        if isinstance(spec, AcceptanceCriterionSpec)
+                        else AcceptanceCriterionSpec(description=ac_text(spec))
+                    )
+                    has_success_contract = isinstance(spec, AcceptanceCriterionSpec) and bool(
+                        spec.verify_command or spec.expected_artifacts
+                    )
+                    if self._run_verify_commands:
                         cwd = self._task_cwd or self._adapter.working_directory or os.getcwd()
                         gate = await _invoke_execution_authority_entry(
                             self,
                             _FOUNDATION_A_ENTRY_RUN_AC_VERIFY_GATE,
-                            spec=spec,
+                            spec=verification_spec,
                             cwd=cwd,
                         )
                         if not gate.passed:
@@ -4445,7 +4445,9 @@ class ParallelACExecutor:
                                 reason=gate.reason,
                             )
                             continue
-                        verification_status = "verified"
+                        verification_status = (
+                            "verified" if has_success_contract else "workspace_digest_verified"
+                        )
 
                     notes: list[str] = [
                         "Skipped via --skip-completed; existing working tree state is treated as satisfied."
@@ -9146,31 +9148,25 @@ Respond with either ATOMIC or the structured JSON object only.
                     route_candidate=observed_route_candidate,
                 )
 
-            # A contract-carrying AC (declares verify_command or expected
-            # artifacts) delegates commands_run and tests_passed to the
-            # orchestrator's authoritative _run_ac_verify_gate. When it declares
-            # expected_artifacts, files_touched is delegated to the same
-            # filesystem oracle so artifact work does not require fabricated
-            # transcript-shaped evidence.
             has_success_contract = isinstance(ac_spec, AcceptanceCriterionSpec) and bool(
                 ac_spec.verify_command or ac_spec.expected_artifacts
             )
             has_expected_artifacts = isinstance(ac_spec, AcceptanceCriterionSpec) and bool(
                 ac_spec.expected_artifacts
             )
-            # Delegating commands_run/tests_passed/files_touched to
-            # _run_ac_verify_gate is only valid when that gate actually runs.
-            # _apply_verify_gate returns early when run_verify_commands is disabled,
-            # so with the gate off we must retain the transcript-backed evidence
-            # rather than drop it.
             verify_gate_active = self._run_verify_commands
             verify_gate_outcome: _VerifyGateOutcome | None = None
-            if success and verify_gate_active and has_success_contract:
+            if success and verify_gate_active and not is_sub_ac:
                 cwd = self._task_cwd or self._adapter.working_directory or os.getcwd()
+                verification_spec = (
+                    ac_spec
+                    if isinstance(ac_spec, AcceptanceCriterionSpec)
+                    else AcceptanceCriterionSpec(description=ac_content)
+                )
                 verify_gate_outcome = await _invoke_execution_authority_entry(
                     self,
                     _FOUNDATION_A_ENTRY_RUN_AC_VERIFY_GATE,
-                    spec=ac_spec,
+                    spec=verification_spec,
                     cwd=cwd,
                 )
 

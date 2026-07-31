@@ -211,6 +211,7 @@ if TYPE_CHECKING:
     from ouroboros.orchestrator.dependency_analyzer import DependencyAnalyzer
     from ouroboros.orchestrator.heartbeat import CancellationRequest
     from ouroboros.orchestrator.model_routing import ModelRouter
+    from ouroboros.orchestrator.parallel_executor import _VerifyGateOutcome
     from ouroboros.orchestrator.route_escalation import RouteEscalationDecision
     from ouroboros.orchestrator.route_policy import RouteCandidate
     from ouroboros.orchestrator.synapse import SessionSignalHub
@@ -334,6 +335,184 @@ class OrchestratorResult:
     messages_processed: int = 0
     final_message: str = ""
     duration_seconds: float = 0.0
+
+
+def _is_sha256_digest(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionVerifyEvidence:
+    workspace_digest: str
+    output_sha256: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "workspace_digest": self.workspace_digest,
+            "output_sha256": self.output_sha256,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> ExecutionVerifyEvidence | None:
+        expected_keys = frozenset({"schema_version", "workspace_digest", "output_sha256"})
+        if not _mapping_has_exact_keys(value, expected_keys) or not isinstance(value, Mapping):
+            return None
+        schema_version = value.get("schema_version")
+        workspace_digest = value.get("workspace_digest")
+        output_sha256 = value.get("output_sha256")
+        if (
+            type(schema_version) is not int
+            or schema_version != 1
+            or not _is_sha256_digest(workspace_digest)
+            or not _is_sha256_digest(output_sha256)
+        ):
+            return None
+        return cls(workspace_digest=workspace_digest, output_sha256=output_sha256)
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionTaskReceipt:
+    ac_index: int
+    outcome: str
+    success: bool
+    verify_evidence: ExecutionVerifyEvidence | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "ac_index": self.ac_index,
+            "outcome": self.outcome,
+            "success": self.success,
+            "verify_evidence": (
+                self.verify_evidence.to_dict() if self.verify_evidence is not None else None
+            ),
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> ExecutionTaskReceipt | None:
+        expected_keys = frozenset({"ac_index", "outcome", "success", "verify_evidence"})
+        if not _mapping_has_exact_keys(value, expected_keys) or not isinstance(value, Mapping):
+            return None
+        ac_index = value.get("ac_index")
+        outcome = value.get("outcome")
+        success = value.get("success")
+        verify_evidence_value = value.get("verify_evidence")
+        if (
+            type(ac_index) is not int
+            or ac_index < 0
+            or not isinstance(outcome, str)
+            or type(success) is not bool
+        ):
+            return None
+        verified_outcomes = {"succeeded", "satisfied_externally"}
+        known_outcomes = verified_outcomes | {"failed", "blocked", "invalid"}
+        if outcome not in known_outcomes or success is not (outcome in verified_outcomes):
+            return None
+        verify_evidence = (
+            None
+            if verify_evidence_value is None
+            else ExecutionVerifyEvidence.from_mapping(verify_evidence_value)
+        )
+        if verify_evidence_value is not None and verify_evidence is None:
+            return None
+        return cls(
+            ac_index=ac_index,
+            outcome=outcome,
+            success=success,
+            verify_evidence=verify_evidence,
+        )
+
+
+def _verify_evidence_from_gate(
+    verify_gate_outcome: _VerifyGateOutcome | None,
+) -> ExecutionVerifyEvidence | None:
+    from ouroboros.orchestrator.parallel_executor import _VerifyGateOutcome
+
+    if (
+        not isinstance(verify_gate_outcome, _VerifyGateOutcome)
+        or verify_gate_outcome.passed is not True
+        or verify_gate_outcome.workspace_mutated is not False
+    ):
+        return None
+    workspace_digest = verify_gate_outcome.workspace_digest
+    if workspace_digest is None or not _is_sha256_digest(workspace_digest):
+        return None
+    return ExecutionVerifyEvidence(
+        workspace_digest=workspace_digest,
+        output_sha256=hashlib.sha256(verify_gate_outcome.output_tail.encode("utf-8")).hexdigest(),
+    )
+
+
+def _completion_receipts_verified(
+    task_receipts: tuple[ExecutionTaskReceipt, ...],
+    expected_count: int,
+    *,
+    allow_external_satisfaction: bool = True,
+) -> bool:
+    accepted_outcomes = (
+        frozenset({"succeeded", "satisfied_externally"})
+        if allow_external_satisfaction
+        else frozenset({"succeeded"})
+    )
+    return (
+        expected_count > 0
+        and len(task_receipts) == expected_count
+        and {receipt.ac_index for receipt in task_receipts} == set(range(expected_count))
+        and all(
+            receipt.outcome in accepted_outcomes
+            and receipt.success is True
+            and receipt.verify_evidence is not None
+            for receipt in task_receipts
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DirectCompletionReceipt:
+    goal: str
+    acceptance_criteria_count: int
+    task_receipts: tuple[ExecutionTaskReceipt, ...]
+    verification_report: str
+
+    def is_verified(self) -> bool:
+        return _completion_receipts_verified(
+            self.task_receipts,
+            self.acceptance_criteria_count,
+            allow_external_satisfaction=False,
+        )
+
+    def to_summary(
+        self,
+        *,
+        final_message: str,
+        messages_processed: int,
+        task_summary: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "goal": self.goal,
+            "acceptance_criteria_count": self.acceptance_criteria_count,
+            "parallel_execution": False,
+            "execution_mode": "direct",
+            "success_count": self.acceptance_criteria_count,
+            "externally_satisfied_count": 0,
+            "satisfied_count": self.acceptance_criteria_count,
+            "failure_count": 0,
+            "blocked_count": 0,
+            "invalid_count": 0,
+            "skipped_count": 0,
+            "verification_report": self.verification_report,
+            "verification_report_sha256": hashlib.sha256(
+                self.verification_report.encode("utf-8")
+            ).hexdigest(),
+            "task_results": [receipt.to_dict() for receipt in self.task_receipts],
+            "final_message": final_message[:500],
+            "messages_processed": messages_processed,
+            **task_summary,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -3243,6 +3422,99 @@ class OrchestratorRunner:
                 },
             )
         return required_cwd or provider_cwd
+
+    async def _build_direct_completion_receipt(
+        self,
+        *,
+        seed: Seed,
+        runtime_handle: RuntimeHandle | None,
+        execution_semantics: Mapping[str, Any],
+    ) -> DirectCompletionReceipt:
+        total_acceptance_criteria = len(seed.acceptance_criteria)
+        if execution_semantics["run_verify_commands"]:
+            from ouroboros.orchestrator.parallel_executor import (
+                _FOUNDATION_A_ENTRY_RUN_AC_VERIFY_GATE,
+                ParallelACExecutor,
+                _invoke_execution_authority_entry,
+            )
+
+            direct_cwd = (
+                self._effective_cwd(runtime_handle)
+                or self._adapter.working_directory
+                or os.getcwd()
+            )
+            direct_verify_executor = ParallelACExecutor(
+                adapter=self._adapter,
+                event_store=self._event_store,
+                console=self._console,
+                enable_decomposition=False,
+                task_cwd=direct_cwd,
+                run_verify_commands=True,
+                verify_command_timeout_seconds=execution_semantics[
+                    "verify_command_timeout_seconds"
+                ],
+                expected_runtime_effect_capabilities=execution_semantics[
+                    "runtime_effect_capabilities"
+                ],
+            )
+            verified_receipts: list[ExecutionTaskReceipt] = []
+            for index, criterion in enumerate(seed.acceptance_criteria):
+                verification_spec = (
+                    criterion
+                    if isinstance(criterion, AcceptanceCriterionSpec)
+                    else AcceptanceCriterionSpec(description=ac_text(criterion))
+                )
+                verify_gate_outcome = await _invoke_execution_authority_entry(
+                    direct_verify_executor,
+                    _FOUNDATION_A_ENTRY_RUN_AC_VERIFY_GATE,
+                    spec=verification_spec,
+                    cwd=direct_cwd,
+                )
+                verified_receipts.append(
+                    ExecutionTaskReceipt(
+                        ac_index=index,
+                        outcome="succeeded",
+                        success=True,
+                        verify_evidence=_verify_evidence_from_gate(verify_gate_outcome),
+                    )
+                )
+            task_receipts = tuple(verified_receipts)
+        else:
+            task_receipts = tuple(
+                ExecutionTaskReceipt(
+                    ac_index=index,
+                    outcome="failed",
+                    success=False,
+                    verify_evidence=None,
+                )
+                for index, _criterion in enumerate(seed.acceptance_criteria)
+            )
+        verified_count = sum(
+            receipt.outcome == "succeeded"
+            and receipt.success is True
+            and receipt.verify_evidence is not None
+            for receipt in task_receipts
+        )
+        report_lines = [
+            "Direct Execution Verification Report",
+            f"Success: {verified_count}/{total_acceptance_criteria}",
+            "",
+            "## Task Results",
+        ]
+        report_lines.extend(
+            (
+                f"- Task {receipt.ac_index + 1}: "
+                f"[{'COMPLETED' if receipt.outcome == 'succeeded' and receipt.success is True and receipt.verify_evidence is not None else 'FAILED'}] "
+                f"outcome={receipt.outcome}"
+            )
+            for receipt in task_receipts
+        )
+        return DirectCompletionReceipt(
+            goal=seed.goal,
+            acceptance_criteria_count=total_acceptance_criteria,
+            task_receipts=task_receipts,
+            verification_report="\n".join(report_lines),
+        )
 
     @staticmethod
     def _canonical_path(value: str) -> str:
@@ -9760,12 +10032,27 @@ class OrchestratorRunner:
             durable_terminal_status: SessionStatus | None = None
             completion_summary: dict[str, Any] | None = None
             acceptance_finalizations: list[dict[str, Any]] | None = None
+            direct_completion_receipt: DirectCompletionReceipt | None = None
             if success:
-                completion_summary = {
-                    "final_message": final_message[:500],
-                    "messages_processed": messages_processed,
-                    **self._task_summary(),
-                }
+                direct_completion_receipt = await self._build_direct_completion_receipt(
+                    seed=seed,
+                    runtime_handle=runtime_handle,
+                    execution_semantics=execution_semantics,
+                )
+                if not direct_completion_receipt.is_verified():
+                    success = False
+                    final_message = (
+                        "Direct execution is not complete: every acceptance criterion requires "
+                        "valid verify-gate evidence."
+                    )
+
+            if success:
+                assert direct_completion_receipt is not None
+                completion_summary = direct_completion_receipt.to_summary(
+                    final_message=final_message,
+                    messages_processed=messages_processed,
+                    task_summary=self._task_summary(),
+                )
                 acceptance_finalizations = self._build_terminal_acceptance_finalizations(
                     seed=seed,
                     parallel_result=None,
@@ -9966,11 +10253,16 @@ class OrchestratorRunner:
                     success=success,
                     session_id=tracker.session_id,
                     execution_id=exec_id,
-                    summary={
-                        "goal": seed.goal,
-                        "acceptance_criteria_count": len(seed.acceptance_criteria),
-                        **self._task_summary(),
-                    },
+                    summary=(
+                        completion_summary
+                        if terminal_status == SessionStatus.COMPLETED.value
+                        and completion_summary is not None
+                        else {
+                            "goal": seed.goal,
+                            "acceptance_criteria_count": len(seed.acceptance_criteria),
+                            **self._task_summary(),
+                        }
+                    ),
                     messages_processed=messages_processed,
                     final_message=final_message,
                     duration_seconds=duration,
@@ -10376,8 +10668,38 @@ class OrchestratorRunner:
         # Calculate duration
         duration = (datetime.now(UTC) - start_time).total_seconds()
 
-        # Determine overall success
-        success = parallel_result.all_succeeded
+        final_message = render_parallel_completion_message(
+            parallel_result,
+            len(seed.acceptance_criteria),
+        )
+        verification_report = render_parallel_verification_report(
+            parallel_result,
+            len(seed.acceptance_criteria),
+            max_decomposition_depth=max_decomposition_depth,
+        )
+
+        task_receipts = tuple(
+            ExecutionTaskReceipt(
+                ac_index=result.ac_index,
+                outcome=result.outcome.value if result.outcome is not None else "unknown",
+                success=result.success,
+                verify_evidence=_verify_evidence_from_gate(result.verify_gate_outcome),
+            )
+            for result in parallel_result.results
+        )
+        completion_receipts_verified = _completion_receipts_verified(
+            task_receipts,
+            len(seed.acceptance_criteria),
+        )
+        completion_evidence_error = None
+        success = parallel_result.all_succeeded and completion_receipts_verified
+        if parallel_result.all_succeeded and not completion_receipts_verified:
+            completion_evidence_error = (
+                "Parallel execution is not complete: every acceptance criterion requires "
+                "valid verify-gate evidence."
+            )
+            final_message = completion_evidence_error
+
         recoverable_failure_pause = None
         if not success:
             recoverable_failure_pause = self._recoverable_failure_pause_from_parallel_result(
@@ -10389,15 +10711,6 @@ class OrchestratorRunner:
                 default_pause_seconds=execution_semantics["usage_limit_pause_seconds"],
             )
 
-        final_message = render_parallel_completion_message(
-            parallel_result,
-            len(seed.acceptance_criteria),
-        )
-        verification_report = render_parallel_verification_report(
-            parallel_result,
-            len(seed.acceptance_criteria),
-            max_decomposition_depth=max_decomposition_depth,
-        )
         execution_summary = {
             "goal": seed.goal,
             "acceptance_criteria_count": len(seed.acceptance_criteria),
@@ -10416,6 +10729,10 @@ class OrchestratorRunner:
             "max_parallel_workers": max_parallel_workers,
             "effective_parallel_workers": effective_workers,
             "verification_report": verification_report,
+            "verification_report_sha256": hashlib.sha256(
+                verification_report.encode("utf-8")
+            ).hexdigest(),
+            "task_results": [receipt.to_dict() for receipt in task_receipts],
             **self._task_summary(),
         }
 
@@ -10503,7 +10820,8 @@ class OrchestratorRunner:
                 session_id=tracker.session_id,
                 execution_id=exec_id,
                 requested_status=SessionStatus.FAILED,
-                error_message=(
+                error_message=completion_evidence_error
+                or (
                     "Partial failure: "
                     f"{parallel_result.failure_count} failed, "
                     f"{parallel_result.blocked_count} blocked, "
@@ -11693,8 +12011,29 @@ Note: This is a resumed session. Please continue from where execution was interr
             duration = (datetime.now(UTC) - start_time).total_seconds()
 
             durable_terminal_status: SessionStatus | None = None
+            completion_summary: dict[str, Any] | None = None
             acceptance_finalizations: list[dict[str, Any]] | None = None
+            direct_completion_receipt: DirectCompletionReceipt | None = None
             if success:
+                direct_completion_receipt = await self._build_direct_completion_receipt(
+                    seed=seed,
+                    runtime_handle=live_runtime_handle,
+                    execution_semantics=execution_semantics,
+                )
+                if not direct_completion_receipt.is_verified():
+                    success = False
+                    final_message = (
+                        "Direct execution is not complete: every acceptance criterion requires "
+                        "valid verify-gate evidence."
+                    )
+
+            if success:
+                assert direct_completion_receipt is not None
+                completion_summary = direct_completion_receipt.to_summary(
+                    final_message=final_message,
+                    messages_processed=messages_processed,
+                    task_summary=self._task_summary(),
+                )
                 acceptance_finalizations = self._build_terminal_acceptance_finalizations(
                     seed=seed,
                     parallel_result=None,
@@ -11709,10 +12048,7 @@ Note: This is a resumed session. Please continue from where execution was interr
                     session_id=session_id,
                     execution_id=tracker.execution_id,
                     requested_status=SessionStatus.COMPLETED,
-                    summary={
-                        "messages_processed": messages_processed,
-                        **self._task_summary(),
-                    },
+                    summary=completion_summary,
                     messages_processed=messages_processed,
                     acceptance_finalizations=acceptance_finalizations,
                 )
@@ -11819,6 +12155,9 @@ Note: This is a resumed session. Please continue from where execution was interr
                 execution_id=tracker.execution_id,
                 session_id=session_id,
                 status=terminal_status,
+                summary=completion_summary
+                if terminal_status == SessionStatus.COMPLETED.value
+                else None,
                 error_message=(
                     final_message
                     if terminal_status
@@ -11893,7 +12232,12 @@ Note: This is a resumed session. Please continue from where execution was interr
                     success=success,
                     session_id=session_id,
                     execution_id=tracker.execution_id,
-                    summary={"resumed": True, **self._task_summary()},
+                    summary=(
+                        {"resumed": True, **completion_summary}
+                        if terminal_status == SessionStatus.COMPLETED.value
+                        and completion_summary is not None
+                        else {"resumed": True, **self._task_summary()}
+                    ),
                     messages_processed=messages_processed,
                     final_message=final_message,
                     duration_seconds=duration,
@@ -11966,6 +12310,8 @@ Note: This is a resumed session. Please continue from where execution was interr
 
 
 __all__ = [
+    "ExecutionTaskReceipt",
+    "ExecutionVerifyEvidence",
     "ExecutionCancelledError",
     "OrchestratorError",
     "OrchestratorResult",

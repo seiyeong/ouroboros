@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import faulthandler
+import hashlib
 import tempfile
 import time
 from typing import Any
@@ -16,6 +17,7 @@ from typing import Any
 import pytest
 
 from ouroboros.core.types import Result
+from ouroboros.events.base import BaseEvent
 from ouroboros.mcp.errors import MCPToolError
 from ouroboros.mcp.job_manager import JobManager, JobSnapshot, JobStatus
 from ouroboros.mcp.tools import evaluation_handlers, execution_handlers
@@ -26,6 +28,12 @@ from ouroboros.mcp.tools.execution_handlers import (
     _run_only_verification_text,
 )
 from ouroboros.mcp.types import ContentType, MCPContentItem, MCPToolResult
+from ouroboros.orchestrator.parallel_executor import render_parallel_verification_report
+from ouroboros.orchestrator.parallel_executor_models import (
+    ACExecutionResult,
+    ParallelExecutionResult,
+)
+from ouroboros.orchestrator.runner import ExecutionTaskReceipt, ExecutionVerifyEvidence
 from ouroboros.persistence.event_store import EventStore
 
 
@@ -35,6 +43,48 @@ async def event_store():
     await store.initialize()
     yield store
     await store.close()
+
+
+def _verified_task_receipt(
+    *,
+    ac_index: int = 0,
+    outcome: str = "succeeded",
+    success: bool = True,
+) -> dict[str, object]:
+    return ExecutionTaskReceipt(
+        ac_index=ac_index,
+        outcome=outcome,
+        success=success,
+        verify_evidence=ExecutionVerifyEvidence(
+            workspace_digest="a" * 64,
+            output_sha256=hashlib.sha256(b"verify output").hexdigest(),
+        ),
+    ).to_dict()
+
+
+def _canonical_execution_summary(
+    verification_report: str,
+    task_results: list[dict[str, object]] | None = None,
+    **overrides: object,
+) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "acceptance_criteria_count": 1,
+        "parallel_execution": True,
+        "success_count": 1,
+        "externally_satisfied_count": 0,
+        "satisfied_count": 1,
+        "failure_count": 0,
+        "blocked_count": 0,
+        "invalid_count": 0,
+        "skipped_count": 0,
+        "verification_report": verification_report,
+        "verification_report_sha256": hashlib.sha256(
+            verification_report.encode("utf-8")
+        ).hexdigest(),
+        "task_results": task_results if task_results is not None else [_verified_task_receipt()],
+    }
+    summary.update(overrides)
+    return summary
 
 
 async def _wait_terminal(job_manager: JobManager, job_id: str) -> JobSnapshot:
@@ -187,13 +237,72 @@ class _SuccessfulExecuteHandler:
         )
 
 
-async def test_successful_run_enqueues_chained_evaluate_job(
+class _ReceiptExecuteHandler(_SuccessfulExecuteHandler):
+    def __init__(self, event_store: EventStore, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._event_store = event_store
+
+    async def handle(
+        self,
+        arguments: dict[str, Any],
+        *,
+        execution_id: str | None = None,
+        session_id_override: str | None = None,
+        synchronous: bool = False,
+    ) -> Result[MCPToolResult, Any]:
+        result = await super().handle(
+            arguments,
+            execution_id=execution_id,
+            session_id_override=session_id_override,
+            synchronous=synchronous,
+        )
+        assert execution_id is not None
+        assert session_id_override is not None
+        await self._event_store.append(
+            BaseEvent(
+                type="execution.terminal",
+                aggregate_type="execution",
+                aggregate_id=execution_id,
+                data={
+                    "session_id": session_id_override,
+                    "status": "completed",
+                    "summary": _canonical_execution_summary(
+                        "Parallel Execution Verification Report\n"
+                        "Success: 1/1\n"
+                        "\n## Task Results\n\n"
+                        "### Task 1: [COMPLETED] canary\n"
+                        "Result:\n"
+                        "tests_passed: exit 0"
+                    ),
+                },
+            )
+        )
+        return result
+
+
+@pytest.mark.parametrize("receipt_query_raises", [False, True], ids=["missing", "query-failed"])
+async def test_run_without_durable_receipt_fails_before_evaluation(
     event_store,
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    receipt_query_raises: bool,
 ) -> None:
     monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
     evaluate_calls: list[dict[str, Any]] = []
+    if receipt_query_raises:
+        original_query_events = event_store.query_events
+
+        async def _raise_for_execution_receipt(
+            aggregate_id: str | None = None,
+            event_type: str | None = None,
+            limit: int = 50,
+            offset: int = 0,
+        ) -> list[BaseEvent]:
+            if event_type == "execution.terminal":
+                raise RuntimeError("receipt storage unavailable")
+            return await original_query_events(aggregate_id, event_type, limit, offset)
+
+        monkeypatch.setattr(event_store, "query_events", _raise_for_execution_receipt)
 
     class FakeEvaluateHandler:
         def __init__(self, **kwargs: Any) -> None:
@@ -237,34 +346,742 @@ async def test_successful_run_enqueues_chained_evaluate_job(
 
     snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
 
-    if snapshot.status != JobStatus.COMPLETED:
-        # Self-explaining flake diagnostics (#1566): a non-COMPLETED terminal
-        # here has historically meant a silently lost terminal append; dump
-        # the full persisted picture for both jobs plus store state.
-        raise AssertionError(
-            f"expected COMPLETED, got {snapshot.status} "
-            f"(result_meta={snapshot.result_meta})\n" + await _dump_all_job_streams(job_manager)
-        )
-    assert snapshot.result_meta["success"] is True
-    evaluation_job_id = snapshot.result_meta["chained_evaluate_job_id"]
-    assert isinstance(evaluation_job_id, str)
-    assert evaluation_job_id.startswith("job_")
-    assert snapshot.result_meta["verification_status"] == "evaluation_enqueued"
-    assert snapshot.result_meta["evaluation_status"] == "enqueued"
+    assert snapshot.status is JobStatus.FAILED
+    assert snapshot.result_meta["success"] is False
+    assert snapshot.result_meta["verification_status"] == "evaluation_unavailable"
+    assert snapshot.result_meta["evaluation_status"] == "receipt_unavailable"
     assert snapshot.result_meta["evaluated"] is False
-    assert "Manual Retry: ooo evaluate" in (snapshot.result_text or "")
+    assert snapshot.result_meta["final_approved"] is False
+    assert "chained_evaluate_job_id" not in snapshot.result_meta
+    assert "Formal Evaluation: receipt_unavailable; run is not complete." in (
+        snapshot.result_text or ""
+    )
+    assert not evaluate_calls
+
+
+async def test_chained_evaluation_artifact_returns_none_without_execution_id(event_store) -> None:
+    run_result = MCPToolResult(
+        content=(MCPContentItem(type=ContentType.TEXT, text="ordinary run output"),),
+        is_error=False,
+        meta={},
+    )
+
+    artifact = await execution_handlers._chained_evaluation_artifact(
+        event_store,
+        run_result,
+        "orch_receipt",
+    )
+
+    assert artifact is None
+
+
+async def test_chained_evaluation_artifact_accepts_renderer_output(event_store) -> None:
+    report = render_parallel_verification_report(
+        ParallelExecutionResult(
+            results=(
+                ACExecutionResult(
+                    ac_index=0,
+                    ac_content="receipt",
+                    success=True,
+                    final_message="### Task 1: [FAILED] incidental markdown",
+                ),
+            ),
+            success_count=1,
+            failure_count=0,
+        ),
+        1,
+    )
+    await event_store.append(
+        BaseEvent(
+            type="execution.terminal",
+            aggregate_type="execution",
+            aggregate_id="exec_renderer_receipt",
+            data={
+                "session_id": "orch_receipt",
+                "status": "completed",
+                "summary": _canonical_execution_summary(report),
+            },
+        )
+    )
+    run_result = MCPToolResult(
+        is_error=False,
+        meta={"execution_id": "exec_renderer_receipt"},
+    )
+
+    artifact = await execution_handlers._chained_evaluation_artifact(
+        event_store,
+        run_result,
+        "orch_receipt",
+    )
+
+    assert artifact is not None
+    assert artifact.startswith("Run acceptance receipt:\n\n" + report)
+    assert "## Durable Task Receipt" in artifact
+
+
+async def test_chained_evaluation_artifact_accepts_direct_receipt(event_store) -> None:
+    report = "\n".join(
+        (
+            "Direct Execution Verification Report",
+            "Success: 1/1",
+            "",
+            "## Task Results",
+        )
+    )
+    await event_store.append(
+        BaseEvent(
+            type="execution.terminal",
+            aggregate_type="execution",
+            aggregate_id="exec_direct_receipt",
+            data={
+                "session_id": "orch_receipt",
+                "status": "completed",
+                "summary": _canonical_execution_summary(
+                    report,
+                    parallel_execution=False,
+                    execution_mode="direct",
+                ),
+            },
+        )
+    )
+    run_result = MCPToolResult(
+        is_error=False,
+        meta={"execution_id": "exec_direct_receipt"},
+    )
+
+    artifact = await execution_handlers._chained_evaluation_artifact(
+        event_store,
+        run_result,
+        "orch_receipt",
+    )
+
+    assert artifact is not None
+    assert artifact.startswith("Run acceptance receipt:\n\n" + report)
+    assert "## Durable Task Receipt" in artifact
+
+
+def test_verification_artifact_prefers_direct_runner_receipt() -> None:
+    report = "\n".join(
+        (
+            "Direct Execution Verification Report",
+            "Success: 1/1",
+            "",
+            "## Task Results",
+        )
+    )
+
+    artifact = execution_handlers.ExecuteSeedHandler._get_verification_artifact(
+        _canonical_execution_summary(
+            report,
+            parallel_execution=False,
+            execution_mode="direct",
+        ),
+        "unverified agent prose",
+    )
+
+    assert artifact == report
+
+
+def test_canonical_execution_receipt_rejects_unlabeled_direct_mode() -> None:
+    report = "\n".join(
+        (
+            "Direct Execution Verification Report",
+            "Success: 1/1",
+            "",
+            "## Task Results",
+        )
+    )
+
+    receipt = execution_handlers._canonical_execution_receipt(
+        _canonical_execution_summary(report, parallel_execution=False)
+    )
+
+    assert receipt is None
+
+
+async def test_chained_evaluation_artifact_rejects_direct_external_receipt(event_store) -> None:
+    report = "\n".join(
+        (
+            "Direct Execution Verification Report",
+            "Success: 1/1",
+            "",
+            "## Task Results",
+        )
+    )
+    await event_store.append(
+        BaseEvent(
+            type="execution.terminal",
+            aggregate_type="execution",
+            aggregate_id="exec_direct_external_receipt",
+            data={
+                "session_id": "orch_receipt",
+                "status": "completed",
+                "summary": _canonical_execution_summary(
+                    report,
+                    task_results=[_verified_task_receipt(outcome="satisfied_externally")],
+                    parallel_execution=False,
+                    execution_mode="direct",
+                    success_count=0,
+                    externally_satisfied_count=1,
+                ),
+            },
+        )
+    )
+
+    artifact = await execution_handlers._chained_evaluation_artifact(
+        event_store,
+        MCPToolResult(is_error=False, meta={"execution_id": "exec_direct_external_receipt"}),
+        "orch_receipt",
+    )
+
+    assert artifact is None
+
+
+async def test_chained_evaluation_artifact_requires_hash_bound_typed_task_receipt(
+    event_store,
+) -> None:
+    report = (
+        "Parallel Execution Verification Report\n"
+        "Success: 1/1\n"
+        "\n## Task Results\n\n"
+        "### Task 1: [COMPLETED] receipt\n"
+        "Result:\n"
+        "tests_passed: exit 0"
+    )
+    summary = _canonical_execution_summary(report)
+    del summary["verification_report_sha256"]
+    del summary["task_results"]
+    await event_store.append(
+        BaseEvent(
+            type="execution.terminal",
+            aggregate_type="execution",
+            aggregate_id="exec_missing_typed_receipt",
+            data={
+                "session_id": "orch_receipt",
+                "status": "completed",
+                "summary": summary,
+            },
+        )
+    )
+
+    artifact = await execution_handlers._chained_evaluation_artifact(
+        event_store,
+        MCPToolResult(is_error=False, meta={"execution_id": "exec_missing_typed_receipt"}),
+        "orch_receipt",
+    )
+
+    assert artifact is None
+
+
+async def test_chained_evaluation_artifact_requires_verified_task_evidence(
+    event_store,
+) -> None:
+    report = (
+        "Parallel Execution Verification Report\n"
+        "Success: 1/1\n"
+        "\n## Task Results\n\n"
+        "### Task 1: [COMPLETED] receipt\n"
+        "Result:\n"
+        "arbitrary worker text"
+    )
+    summary = _canonical_execution_summary(
+        report,
+        task_results=[
+            {
+                "ac_index": 0,
+                "outcome": "succeeded",
+                "success": True,
+                "verify_evidence": None,
+            }
+        ],
+    )
+    await event_store.append(
+        BaseEvent(
+            type="execution.terminal",
+            aggregate_type="execution",
+            aggregate_id="exec_unverified_task_receipt",
+            data={
+                "session_id": "orch_receipt",
+                "status": "completed",
+                "summary": summary,
+            },
+        )
+    )
+
+    artifact = await execution_handlers._chained_evaluation_artifact(
+        event_store,
+        MCPToolResult(is_error=False, meta={"execution_id": "exec_unverified_task_receipt"}),
+        "orch_receipt",
+    )
+
+    assert artifact is None
+
+
+@pytest.mark.parametrize(
+    ("terminal_session_id", "terminal_status", "summary"),
+    [
+        (
+            "orch_other",
+            "completed",
+            {
+                "verification_report": (
+                    "Parallel Execution Verification Report\n"
+                    "Success: 1/1\n"
+                    "\n## Task Results\n\n"
+                    "### Task 1"
+                )
+            },
+        ),
+        ("orch_receipt", "completed", {"verification_report": "  \n"}),
+        ("orch_receipt", "completed", "not a receipt mapping"),
+        ("orch_receipt", "completed", {"verification_report": "garbage"}),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                (
+                    "Parallel Execution Verification Report\n"
+                    "Success: 0/1\n"
+                    "\n## Task Results\n\n"
+                    "### Task 1: [FAILED]"
+                ),
+                success_count=0,
+                satisfied_count=0,
+                failure_count=1,
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 1: [FAILED] injected contradiction",
+                task_results=[_verified_task_receipt(outcome="failed", success=False)],
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "Result:",
+                task_results=[
+                    {
+                        "ac_index": 0,
+                        "outcome": "succeeded",
+                        "success": True,
+                        "verify_evidence": None,
+                    }
+                ],
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 1: [COMPLETED] malformed verify evidence",
+                task_results=[
+                    {
+                        "ac_index": 0,
+                        "outcome": "succeeded",
+                        "success": True,
+                        "verify_evidence": {
+                            "schema_version": 1,
+                            "workspace_digest": "not-a-sha256",
+                            "output_sha256": hashlib.sha256(b"verify output").hexdigest(),
+                        },
+                    }
+                ],
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 1: [COMPLETED] legacy worker proxy",
+                task_results=[
+                    {
+                        "ac_index": 0,
+                        "outcome": "succeeded",
+                        "success": True,
+                        "evidence_present": True,
+                    }
+                ],
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 1: [COMPLETED] canary",
+                failure_count=1,
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 1: [COMPLETED] canary"
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 1: [COMPLETED] canary",
+                verification_report_sha256="0" * 64,
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 2: [COMPLETED] wrong index",
+                task_results=[_verified_task_receipt(ac_index=1)],
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 1: [COMPLETED] canary",
+                task_results=[_verified_task_receipt(outcome="satisfied_externally")],
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 1: [COMPLETED] parent\n"
+                "Decomposed into 1 Subtasks\n\n"
+                "#### Subtask 1.1: [FAILED] hidden failure",
+                task_results=[_verified_task_receipt(outcome="failed", success=False)],
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            {"verification_report": "Parallel Execution Verification Report\nSuccess: 1/1"},
+        ),
+    ],
+    ids=[
+        "session-mismatch",
+        "empty-report",
+        "malformed-summary",
+        "unstructured-report",
+        "failed-report",
+        "contradictory-task-result",
+        "missing-typed-evidence",
+        "legacy-worker-evidence-proxy",
+        "malformed-verify-gate-digest",
+        "typed-failure-count",
+        "duplicate-success-count",
+        "report-hash-mismatch",
+        "wrong-task-index",
+        "outcome-count-mismatch",
+        "failed-subtask",
+        "missing-task-results",
+    ],
+)
+async def test_chained_evaluation_artifact_requires_matching_nonempty_receipt(
+    event_store,
+    terminal_session_id: str,
+    terminal_status: str,
+    summary,
+) -> None:
+    await event_store.append(
+        BaseEvent(
+            type="execution.terminal",
+            aggregate_type="execution",
+            aggregate_id="exec_receipt",
+            data={
+                "session_id": terminal_session_id,
+                "status": terminal_status,
+                "summary": summary,
+            },
+        )
+    )
+    run_result = MCPToolResult(
+        content=(MCPContentItem(type=ContentType.TEXT, text="ordinary run output"),),
+        is_error=False,
+        meta={"execution_id": "exec_receipt"},
+    )
+
+    artifact = await execution_handlers._chained_evaluation_artifact(
+        event_store,
+        run_result,
+        "orch_receipt",
+    )
+
+    assert artifact is None
+
+
+@pytest.mark.parametrize(
+    ("report", "summary_overrides", "expected_detail"),
+    [
+        pytest.param(
+            "Parallel Execution Verification Report\n"
+            "Success: 1/1\n"
+            "\n## Task Results\n\n"
+            "### Task 1: [COMPLETED] receipt\n"
+            "File Changes:\n- lazycodex_canary.txt\n"
+            "tests_passed: verify_command exit 0",
+            {},
+            "verify_command exit 0",
+            id="parallel",
+        ),
+        pytest.param(
+            "Direct Execution Verification Report\n"
+            "Success: 1/1\n"
+            "\n## Task Results\n"
+            "- Task 1: [COMPLETED] outcome=succeeded",
+            {"parallel_execution": False, "execution_mode": "direct"},
+            "Direct Execution Verification Report",
+            id="direct",
+        ),
+    ],
+)
+async def test_chained_evaluate_uses_durable_execution_receipt(
+    event_store,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    report: str,
+    summary_overrides: dict[str, object],
+    expected_detail: str,
+) -> None:
+    monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
+    evaluate_calls: list[dict[str, Any]] = []
+
+    class ReceiptExecuteHandler:
+        agent_runtime_backend = None
+        llm_backend = None
+
+        async def handle(
+            self,
+            arguments: dict[str, Any],
+            *,
+            execution_id: str | None = None,
+            session_id_override: str | None = None,
+            synchronous: bool = False,
+        ) -> Result[MCPToolResult, Any]:
+            assert execution_id is not None
+            assert session_id_override is not None
+            assert synchronous is True
+            await event_store.append(
+                BaseEvent(
+                    type="execution.terminal",
+                    aggregate_type="execution",
+                    aggregate_id=execution_id,
+                    data={
+                        "session_id": session_id_override,
+                        "status": "completed",
+                        "summary": _canonical_execution_summary(report, **summary_overrides),
+                    },
+                )
+            )
+            return Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="run-only warning"),),
+                    is_error=False,
+                    meta={
+                        "session_id": session_id_override,
+                        "execution_id": execution_id,
+                        "success": True,
+                    },
+                )
+            )
+
+    class FakeEvaluateHandler:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def handle(self, arguments: dict[str, Any]) -> Result[MCPToolResult, Any]:
+            evaluate_calls.append(arguments)
+            return Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="approved"),),
+                    is_error=False,
+                    meta={"final_approved": True, "session_id": arguments["session_id"]},
+                )
+            )
+
+    monkeypatch.setattr(evaluation_handlers, "EvaluateHandler", FakeEvaluateHandler)
+
+    job_manager = JobManager(event_store)
+    handler = StartExecuteSeedHandler(
+        execute_handler=ReceiptExecuteHandler(),  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=job_manager,
+    )
+
+    started = await handler.handle({"seed_content": "goal: receipt\n", "cwd": str(tmp_path)})
+    assert started.is_ok
+    snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
+
+    assert snapshot.status is JobStatus.COMPLETED
     await _wait_for_call(evaluate_calls)
-    evaluate_snapshot = await job_manager.get_snapshot(evaluation_job_id)
-    assert evaluate_snapshot.job_type == "evaluate"
-    assert evaluate_calls
-    assert evaluate_calls[0]["arguments"]["session_id"] == snapshot.result_meta["session_id"]
-    assert evaluate_calls[0]["arguments"]["seed_content"] == seed_content
-    assert evaluate_calls[0]["arguments"]["acceptance_criteria"] == [
-        "Tasks can be created",
-        "Tasks can be listed",
-    ]
-    assert evaluate_calls[0]["arguments"]["working_dir"] == str(tmp_path)
-    assert "execution artifact" in evaluate_calls[0]["arguments"]["artifact"]
+    artifact = evaluate_calls[0]["artifact"]
+    assert artifact.startswith("Run acceptance receipt:")
+    assert expected_detail in artifact
+    assert "run-only warning" not in artifact
+
+
+async def test_chained_evaluate_rejection_fails_run(
+    event_store,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
+
+    class RejectingEvaluateHandler:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def handle(self, arguments: dict[str, Any]) -> Result[MCPToolResult, Any]:
+            return Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="rejected AC"),),
+                    is_error=False,
+                    meta={"final_approved": False, "session_id": arguments["session_id"]},
+                )
+            )
+
+    monkeypatch.setattr(evaluation_handlers, "EvaluateHandler", RejectingEvaluateHandler)
+
+    job_manager = JobManager(event_store)
+    handler = StartExecuteSeedHandler(
+        execute_handler=_ReceiptExecuteHandler(event_store),  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=job_manager,
+    )
+
+    started = await handler.handle({"seed_content": "goal: rejection\n", "cwd": str(tmp_path)})
+    assert started.is_ok
+
+    snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
+
+    assert snapshot.status is JobStatus.FAILED
+    assert snapshot.result_meta["success"] is False
+    assert snapshot.result_meta["evaluated"] is True
+    assert snapshot.result_meta["verification_status"] == "evaluation_rejected"
+    assert snapshot.result_meta["evaluation_status"] == "rejected"
+    assert snapshot.result_meta["final_approved"] is False
+    assert "Formal Evaluation: rejected; run is not complete." in (snapshot.result_text or "")
+
+
+async def test_chained_evaluate_timeout_fails_run_with_specific_meta(
+    event_store,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
+
+    class TimedOutEvaluateHandler:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def handle(self, arguments: dict[str, Any]) -> Result[MCPToolResult, Any]:
+            return Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="evaluation timed out"),),
+                    is_error=True,
+                    meta={
+                        "session_id": arguments["session_id"],
+                        "evaluation_status": "timed_out",
+                    },
+                )
+            )
+
+    monkeypatch.setattr(evaluation_handlers, "EvaluateHandler", TimedOutEvaluateHandler)
+
+    job_manager = JobManager(event_store)
+    handler = StartExecuteSeedHandler(
+        execute_handler=_ReceiptExecuteHandler(event_store),  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=job_manager,
+    )
+
+    started = await handler.handle({"seed_content": "goal: timeout\n", "cwd": str(tmp_path)})
+    assert started.is_ok
+
+    snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
+
+    assert snapshot.status is JobStatus.FAILED
+    assert snapshot.result_meta["evaluated"] is False
+    assert snapshot.result_meta["verification_status"] == "evaluation_unavailable"
+    assert snapshot.result_meta["evaluation_status"] == "timed_out"
+    assert snapshot.result_meta["final_approved"] is False
+    assert snapshot.result_meta["chained_evaluate_job_id"].startswith("job_")
+
+
+async def test_chained_evaluate_completed_without_verdict_fails_run(
+    event_store,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
+
+    class InvalidEvaluateHandler:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def handle(self, arguments: dict[str, Any]) -> Result[MCPToolResult, Any]:
+            return Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="missing verdict"),),
+                    is_error=False,
+                    meta={"session_id": arguments["session_id"]},
+                )
+            )
+
+    monkeypatch.setattr(evaluation_handlers, "EvaluateHandler", InvalidEvaluateHandler)
+
+    job_manager = JobManager(event_store)
+    handler = StartExecuteSeedHandler(
+        execute_handler=_ReceiptExecuteHandler(event_store),  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=job_manager,
+    )
+
+    started = await handler.handle({"seed_content": "goal: invalid\n", "cwd": str(tmp_path)})
+    assert started.is_ok
+
+    snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
+
+    assert snapshot.status is JobStatus.FAILED
+    assert snapshot.result_meta["evaluated"] is False
+    assert snapshot.result_meta["evaluation_status"] == "invalid_result"
+    assert snapshot.result_meta["final_approved"] is False
+    assert snapshot.result_meta["chained_evaluate_job_id"].startswith("job_")
 
 
 async def test_run_job_stranded_without_terminal_event_still_terminalizes(
@@ -300,7 +1117,7 @@ async def test_run_job_stranded_without_terminal_event_still_terminalizes(
 
     job_manager = JobManager(event_store)
     handler = StartExecuteSeedHandler(
-        execute_handler=_SuccessfulExecuteHandler(text="execution artifact"),  # type: ignore[arg-type]
+        execute_handler=_ReceiptExecuteHandler(event_store, text="execution artifact"),  # type: ignore[arg-type]
         event_store=event_store,
         job_manager=job_manager,
     )
@@ -388,7 +1205,8 @@ async def test_chained_evaluate_uses_execution_worktree_when_present(
 
     job_manager = JobManager(event_store)
     handler = StartExecuteSeedHandler(
-        execute_handler=_SuccessfulExecuteHandler(
+        execute_handler=_ReceiptExecuteHandler(
+            event_store,
             text="execution artifact",
             worktree_path=str(execution_worktree),
         ),  # type: ignore[arg-type]
@@ -493,7 +1311,7 @@ async def test_auto_evaluate_config_false_preserves_legacy_run_meta_exactly(
     assert snapshot.result_meta["verification_status"] == "executed_unverified"
 
 
-async def test_evaluate_enqueue_failure_keeps_run_completed(
+async def test_evaluate_enqueue_failure_fails_run(
     event_store,
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -511,7 +1329,7 @@ async def test_evaluate_enqueue_failure_keeps_run_completed(
 
     job_manager = JobManager(event_store)
     handler = StartExecuteSeedHandler(
-        execute_handler=_SuccessfulExecuteHandler(),  # type: ignore[arg-type]
+        execute_handler=_ReceiptExecuteHandler(event_store),  # type: ignore[arg-type]
         event_store=event_store,
         job_manager=job_manager,
     )
@@ -521,13 +1339,13 @@ async def test_evaluate_enqueue_failure_keeps_run_completed(
 
     snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
 
-    assert snapshot.status == JobStatus.COMPLETED
-    assert snapshot.result_meta["success"] is True
+    assert snapshot.status == JobStatus.FAILED
+    assert snapshot.result_meta["success"] is False
     assert snapshot.result_meta["evaluation_status"] == "enqueue_failed"
     assert snapshot.result_meta["evaluation_error"] == "enqueue boom"
     assert snapshot.result_meta["next_step"].startswith("ooo evaluate orch_")
     assert "chained_evaluate_job_id" not in snapshot.result_meta
-    assert "run result remains successful" in (snapshot.result_text or "")
+    assert "Formal Evaluation: enqueue_failed; run is not complete." in (snapshot.result_text or "")
 
 
 async def test_start_evaluate_timeout_writes_terminal_event(

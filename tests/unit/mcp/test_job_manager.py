@@ -766,7 +766,7 @@ class TestJobManager:
             await _cancel_manager_tasks(manager)
             await store.close()
 
-    async def test_execution_terminal_completion_preserves_success_result_meta(
+    async def test_execution_terminal_completion_preserves_approved_evaluation_result_meta(
         self, tmp_path
     ) -> None:
         store = _build_store(tmp_path)
@@ -789,14 +789,21 @@ class TestJobManager:
                 try:
                     await asyncio.sleep(1.2)
                     return MCPToolResult(
-                        content=(MCPContentItem(type=ContentType.TEXT, text="run complete"),),
+                        content=(
+                            MCPContentItem(
+                                type=ContentType.TEXT,
+                                text="Formal Evaluation: APPROVED\nChained Evaluation Job ID: job_eval_123",
+                            ),
+                        ),
                         is_error=False,
                         meta={
                             "success": True,
-                            "verification_status": "evaluation_enqueued",
+                            "evaluated": True,
+                            "verification_status": "verified",
+                            "formal_evaluation_required": False,
                             "chained_evaluate_job_id": "job_eval_123",
-                            "evaluation_status": "enqueued",
-                            "next_step": "ouroboros_job_wait job_eval_123",
+                            "evaluation_status": "approved",
+                            "final_approved": True,
                         },
                     )
                 except asyncio.CancelledError:
@@ -819,11 +826,17 @@ class TestJobManager:
             )
 
             assert snapshot.result_meta["completed_from_execution_terminal"] is True
-            assert snapshot.result_meta["verification_status"] == "evaluation_enqueued"
+            assert snapshot.result_meta["verification_status"] == "verified"
+            assert snapshot.result_meta["evaluated"] is True
+            assert snapshot.result_meta["formal_evaluation_required"] is False
             assert snapshot.result_meta["chained_evaluate_job_id"] == "job_eval_123"
-            assert snapshot.result_meta["evaluation_status"] == "enqueued"
-            assert snapshot.result_meta["next_step"] == "ouroboros_job_wait job_eval_123"
-            assert snapshot.message == "Execution complete; formal evaluation enqueued"
+            assert snapshot.result_meta["evaluation_status"] == "approved"
+            assert snapshot.result_meta["final_approved"] is True
+            assert "next_step" not in snapshot.result_meta
+            assert snapshot.result_text == (
+                "Formal Evaluation: APPROVED\nChained Evaluation Job ID: job_eval_123"
+            )
+            assert snapshot.message == "Execution complete; formal evaluation approved"
             assert cancelled is False
         finally:
             await _cancel_manager_tasks(manager)
@@ -6196,6 +6209,7 @@ class TestZombieJobReconciliation:
         owner_start_time: float | None,
         session_id: str | None = None,
         execution_id: str | None = None,
+        preserve_runner_result: bool = False,
     ) -> JobManager:
         writer = JobManager(store)
         data: dict = {
@@ -6206,6 +6220,7 @@ class TestZombieJobReconciliation:
                 "session_id": session_id,
                 "execution_id": execution_id,
                 "lineage_id": None,
+                "preserve_runner_result": preserve_runner_result,
             },
         }
         if owner_pid is not None:
@@ -6279,6 +6294,77 @@ class TestZombieJobReconciliation:
             assert [event.type for event in events] == [
                 "mcp.job.created",
                 "mcp.job.failed",
+            ]
+        finally:
+            await store.close()
+
+    async def test_live_owner_does_not_recover_completed_execution_terminal(self, tmp_path) -> None:
+        store = _build_store(tmp_path)
+        try:
+            session_id = "orch_live_completed"
+            execution_id = "exec_live_completed"
+            await self._seed_running_job(
+                store,
+                "job_live_completed",
+                owner_pid=4_242_424,
+                owner_start_time=111.0,
+                session_id=session_id,
+                execution_id=execution_id,
+            )
+            await store.append(
+                BaseEvent(
+                    type="execution.terminal",
+                    aggregate_type="execution",
+                    aggregate_id=execution_id,
+                    data={"session_id": session_id, "status": "completed"},
+                )
+            )
+            restarted = JobManager(store)
+
+            with patch.object(job_manager_module, "is_process_identity_alive", return_value=True):
+                snapshot = await restarted.get_snapshot("job_live_completed")
+
+            assert snapshot.status is JobStatus.RUNNING
+            events, _ = await store.get_events_after("job", "job_live_completed", last_row_id=0)
+            assert [event.type for event in events] == ["mcp.job.created"]
+        finally:
+            await store.close()
+
+    async def test_dead_owner_preserving_runner_result_is_interrupted_after_execution_terminal(
+        self, tmp_path
+    ) -> None:
+        store = _build_store(tmp_path)
+        try:
+            session_id = "orch_preserved_terminal"
+            execution_id = "exec_preserved_terminal"
+            await self._seed_running_job(
+                store,
+                "job_preserved_terminal",
+                owner_pid=4_242_424,
+                owner_start_time=111.0,
+                session_id=session_id,
+                execution_id=execution_id,
+                preserve_runner_result=True,
+            )
+            await store.append(
+                BaseEvent(
+                    type="execution.terminal",
+                    aggregate_type="execution",
+                    aggregate_id=execution_id,
+                    data={"session_id": session_id, "status": "completed"},
+                )
+            )
+            restarted = JobManager(store)
+
+            with patch.object(job_manager_module, "is_process_identity_alive", return_value=False):
+                snapshot = await restarted.get_snapshot("job_preserved_terminal")
+
+            assert snapshot.status is JobStatus.INTERRUPTED
+            assert snapshot.result_meta["interrupted_from_dead_owner"] is True
+            events, _ = await store.get_events_after("job", "job_preserved_terminal", last_row_id=0)
+            assert [event.type for event in events] == [
+                "mcp.job.created",
+                "mcp.job.interrupted",
             ]
         finally:
             await store.close()
