@@ -613,24 +613,27 @@ async def _chained_evaluation_artifact(
     event_store: EventStore,
     run_result: MCPToolResult,
     session_id: str | None,
-) -> str:
-    fallback = run_result.text_content or "Execution completed successfully."
+) -> str | None:
     execution_id = run_result.meta.get("execution_id")
     if not isinstance(execution_id, str) or not execution_id:
-        return fallback
+        log.warning(
+            "mcp.tool.start_execute_seed.chained_evaluate.receipt_missing",
+            session_id=session_id,
+        )
+        return None
     try:
         terminal_events = await event_store.query_events(
             aggregate_id=execution_id,
             event_type="execution.terminal",
             limit=None,
         )
-    except Exception:  # noqa: BLE001 - formal evaluation still owns the final gate.
+    except Exception:  # noqa: BLE001 - execution receipt failure must fail the parent Run.
         log.warning(
             "mcp.tool.start_execute_seed.chained_evaluate.receipt_query_failed",
             execution_id=execution_id,
             exc_info=True,
         )
-        return fallback
+        return None
     for event in terminal_events:
         data = event.data
         if data.get("session_id") != session_id or data.get("status") != "completed":
@@ -646,7 +649,7 @@ async def _chained_evaluation_artifact(
         execution_id=execution_id,
         session_id=session_id,
     )
-    return fallback
+    return None
 
 
 def _append_result_text(
@@ -2479,6 +2482,26 @@ class StartExecuteSeedHandler:
             run_result,
             session_id,
         )
+        if artifact is None:
+            error = "Durable execution receipt is unavailable"
+            return _append_result_text(
+                run_result,
+                _evaluation_failure_text(
+                    session_id,
+                    evaluation_status="receipt_unavailable",
+                    error=error,
+                    evaluation_job_id=None,
+                ),
+                meta=_evaluation_failure_meta(
+                    run_result,
+                    session_id=session_id,
+                    evaluation_status="receipt_unavailable",
+                    evaluation_job_id=None,
+                    evaluated=False,
+                    error=error,
+                ),
+                is_error=True,
+            )
         evaluation_arguments: dict[str, Any] = {
             "session_id": session_id,
             "artifact": artifact,

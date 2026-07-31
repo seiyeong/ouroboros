@@ -188,13 +188,65 @@ class _SuccessfulExecuteHandler:
         )
 
 
-async def test_successful_run_waits_for_chained_evaluate_approval(
+class _ReceiptExecuteHandler(_SuccessfulExecuteHandler):
+    def __init__(self, event_store: EventStore, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._event_store = event_store
+
+    async def handle(
+        self,
+        arguments: dict[str, Any],
+        *,
+        execution_id: str | None = None,
+        session_id_override: str | None = None,
+        synchronous: bool = False,
+    ) -> Result[MCPToolResult, Any]:
+        result = await super().handle(
+            arguments,
+            execution_id=execution_id,
+            session_id_override=session_id_override,
+            synchronous=synchronous,
+        )
+        assert execution_id is not None
+        assert session_id_override is not None
+        await self._event_store.append(
+            BaseEvent(
+                type="execution.terminal",
+                aggregate_type="execution",
+                aggregate_id=execution_id,
+                data={
+                    "session_id": session_id_override,
+                    "status": "completed",
+                    "summary": {"verification_report": "Success: 1/1\ntests_passed: exit 0"},
+                },
+            )
+        )
+        return result
+
+
+@pytest.mark.parametrize("receipt_query_raises", [False, True], ids=["missing", "query-failed"])
+async def test_run_without_durable_receipt_fails_before_evaluation(
     event_store,
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    receipt_query_raises: bool,
 ) -> None:
     monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
     evaluate_calls: list[dict[str, Any]] = []
+    if receipt_query_raises:
+        original_query_events = event_store.query_events
+
+        async def _raise_for_execution_receipt(
+            aggregate_id: str | None = None,
+            event_type: str | None = None,
+            limit: int = 50,
+            offset: int = 0,
+        ) -> list[BaseEvent]:
+            if event_type == "execution.terminal":
+                raise RuntimeError("receipt storage unavailable")
+            return await original_query_events(aggregate_id, event_type, limit, offset)
+
+        monkeypatch.setattr(event_store, "query_events", _raise_for_execution_receipt)
 
     class FakeEvaluateHandler:
         def __init__(self, **kwargs: Any) -> None:
@@ -238,38 +290,75 @@ async def test_successful_run_waits_for_chained_evaluate_approval(
 
     snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
 
-    if snapshot.status != JobStatus.COMPLETED:
-        # Self-explaining flake diagnostics (#1566): a non-COMPLETED terminal
-        # here has historically meant a silently lost terminal append; dump
-        # the full persisted picture for both jobs plus store state.
-        raise AssertionError(
-            f"expected COMPLETED, got {snapshot.status} "
-            f"(result_meta={snapshot.result_meta})\n" + await _dump_all_job_streams(job_manager)
+    assert snapshot.status is JobStatus.FAILED
+    assert snapshot.result_meta["success"] is False
+    assert snapshot.result_meta["verification_status"] == "evaluation_unavailable"
+    assert snapshot.result_meta["evaluation_status"] == "receipt_unavailable"
+    assert snapshot.result_meta["evaluated"] is False
+    assert snapshot.result_meta["final_approved"] is False
+    assert "chained_evaluate_job_id" not in snapshot.result_meta
+    assert "Formal Evaluation: receipt_unavailable; run is not complete." in (
+        snapshot.result_text or ""
+    )
+    assert not evaluate_calls
+
+
+async def test_chained_evaluation_artifact_returns_none_without_execution_id(event_store) -> None:
+    run_result = MCPToolResult(
+        content=(MCPContentItem(type=ContentType.TEXT, text="ordinary run output"),),
+        is_error=False,
+        meta={},
+    )
+
+    artifact = await execution_handlers._chained_evaluation_artifact(
+        event_store,
+        run_result,
+        "orch_receipt",
+    )
+
+    assert artifact is None
+
+
+@pytest.mark.parametrize(
+    ("terminal_session_id", "terminal_status", "summary"),
+    [
+        ("orch_other", "completed", {"verification_report": "Success: 1/1"}),
+        ("orch_receipt", "completed", {"verification_report": "  \n"}),
+        ("orch_receipt", "completed", "not a receipt mapping"),
+    ],
+    ids=["session-mismatch", "empty-report", "malformed-summary"],
+)
+async def test_chained_evaluation_artifact_requires_matching_nonempty_receipt(
+    event_store,
+    terminal_session_id: str,
+    terminal_status: str,
+    summary,
+) -> None:
+    await event_store.append(
+        BaseEvent(
+            type="execution.terminal",
+            aggregate_type="execution",
+            aggregate_id="exec_receipt",
+            data={
+                "session_id": terminal_session_id,
+                "status": terminal_status,
+                "summary": summary,
+            },
         )
-    assert snapshot.result_meta["success"] is True
-    evaluation_job_id = snapshot.result_meta["chained_evaluate_job_id"]
-    assert isinstance(evaluation_job_id, str)
-    assert evaluation_job_id.startswith("job_")
-    assert snapshot.result_meta["verification_status"] == "verified"
-    assert snapshot.result_meta["evaluation_status"] == "approved"
-    assert snapshot.result_meta["evaluated"] is True
-    assert snapshot.result_meta["formal_evaluation_required"] is False
-    assert snapshot.result_meta["final_approved"] is True
-    assert "next_step" not in snapshot.result_meta
-    assert "Formal Evaluation: APPROVED" in (snapshot.result_text or "")
-    assert "Formal Evaluation: NOT evaluated" not in (snapshot.result_text or "")
-    await _wait_for_call(evaluate_calls)
-    evaluate_snapshot = await job_manager.get_snapshot(evaluation_job_id)
-    assert evaluate_snapshot.job_type == "evaluate"
-    assert evaluate_calls
-    assert evaluate_calls[0]["arguments"]["session_id"] == snapshot.result_meta["session_id"]
-    assert evaluate_calls[0]["arguments"]["seed_content"] == seed_content
-    assert evaluate_calls[0]["arguments"]["acceptance_criteria"] == [
-        "Tasks can be created",
-        "Tasks can be listed",
-    ]
-    assert evaluate_calls[0]["arguments"]["working_dir"] == str(tmp_path)
-    assert "execution artifact" in evaluate_calls[0]["arguments"]["artifact"]
+    )
+    run_result = MCPToolResult(
+        content=(MCPContentItem(type=ContentType.TEXT, text="ordinary run output"),),
+        is_error=False,
+        meta={"execution_id": "exec_receipt"},
+    )
+
+    artifact = await execution_handlers._chained_evaluation_artifact(
+        event_store,
+        run_result,
+        "orch_receipt",
+    )
+
+    assert artifact is None
 
 
 async def test_chained_evaluate_uses_durable_execution_receipt(
@@ -384,7 +473,7 @@ async def test_chained_evaluate_rejection_fails_run(
 
     job_manager = JobManager(event_store)
     handler = StartExecuteSeedHandler(
-        execute_handler=_SuccessfulExecuteHandler(),  # type: ignore[arg-type]
+        execute_handler=_ReceiptExecuteHandler(event_store),  # type: ignore[arg-type]
         event_store=event_store,
         job_manager=job_manager,
     )
@@ -430,7 +519,7 @@ async def test_chained_evaluate_timeout_fails_run_with_specific_meta(
 
     job_manager = JobManager(event_store)
     handler = StartExecuteSeedHandler(
-        execute_handler=_SuccessfulExecuteHandler(),  # type: ignore[arg-type]
+        execute_handler=_ReceiptExecuteHandler(event_store),  # type: ignore[arg-type]
         event_store=event_store,
         job_manager=job_manager,
     )
@@ -472,7 +561,7 @@ async def test_chained_evaluate_completed_without_verdict_fails_run(
 
     job_manager = JobManager(event_store)
     handler = StartExecuteSeedHandler(
-        execute_handler=_SuccessfulExecuteHandler(),  # type: ignore[arg-type]
+        execute_handler=_ReceiptExecuteHandler(event_store),  # type: ignore[arg-type]
         event_store=event_store,
         job_manager=job_manager,
     )
@@ -522,7 +611,7 @@ async def test_run_job_stranded_without_terminal_event_still_terminalizes(
 
     job_manager = JobManager(event_store)
     handler = StartExecuteSeedHandler(
-        execute_handler=_SuccessfulExecuteHandler(text="execution artifact"),  # type: ignore[arg-type]
+        execute_handler=_ReceiptExecuteHandler(event_store, text="execution artifact"),  # type: ignore[arg-type]
         event_store=event_store,
         job_manager=job_manager,
     )
@@ -610,7 +699,8 @@ async def test_chained_evaluate_uses_execution_worktree_when_present(
 
     job_manager = JobManager(event_store)
     handler = StartExecuteSeedHandler(
-        execute_handler=_SuccessfulExecuteHandler(
+        execute_handler=_ReceiptExecuteHandler(
+            event_store,
             text="execution artifact",
             worktree_path=str(execution_worktree),
         ),  # type: ignore[arg-type]
@@ -733,7 +823,7 @@ async def test_evaluate_enqueue_failure_fails_run(
 
     job_manager = JobManager(event_store)
     handler = StartExecuteSeedHandler(
-        execute_handler=_SuccessfulExecuteHandler(),  # type: ignore[arg-type]
+        execute_handler=_ReceiptExecuteHandler(event_store),  # type: ignore[arg-type]
         event_store=event_store,
         job_manager=job_manager,
     )
