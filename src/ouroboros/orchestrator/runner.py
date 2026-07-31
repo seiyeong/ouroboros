@@ -10468,19 +10468,6 @@ class OrchestratorRunner:
         # Calculate duration
         duration = (datetime.now(UTC) - start_time).total_seconds()
 
-        # Determine overall success
-        success = parallel_result.all_succeeded
-        recoverable_failure_pause = None
-        if not success:
-            recoverable_failure_pause = self._recoverable_failure_pause_from_parallel_result(
-                parallel_result,
-                now=datetime.now(UTC),
-                require_all_failures_recoverable=not bool(
-                    getattr(parallel_result, "recoverable_route_pause", False)
-                ),
-                default_pause_seconds=execution_semantics["usage_limit_pause_seconds"],
-            )
-
         final_message = render_parallel_completion_message(
             parallel_result,
             len(seed.acceptance_criteria),
@@ -10491,7 +10478,7 @@ class OrchestratorRunner:
             max_decomposition_depth=max_decomposition_depth,
         )
 
-        def task_receipt(result: ACExecutionResult) -> dict[str, object]:
+        def task_receipt(result: ACExecutionResult) -> ExecutionTaskReceipt:
             verify_gate_outcome = result.verify_gate_outcome
             workspace_digest = (
                 verify_gate_outcome.workspace_digest
@@ -10519,7 +10506,39 @@ class OrchestratorRunner:
                 outcome=result.outcome.value if result.outcome is not None else "unknown",
                 success=result.success,
                 verify_evidence=verify_evidence,
-            ).to_dict()
+            )
+
+        task_receipts = tuple(task_receipt(result) for result in parallel_result.results)
+        expected_ac_indices = set(range(len(seed.acceptance_criteria)))
+        completion_receipts_verified = (
+            len(task_receipts) == len(seed.acceptance_criteria)
+            and {receipt.ac_index for receipt in task_receipts} == expected_ac_indices
+            and all(
+                receipt.outcome in {"succeeded", "satisfied_externally"}
+                and receipt.success is True
+                and receipt.verify_evidence is not None
+                for receipt in task_receipts
+            )
+        )
+        completion_evidence_error = None
+        success = parallel_result.all_succeeded and completion_receipts_verified
+        if parallel_result.all_succeeded and not completion_receipts_verified:
+            completion_evidence_error = (
+                "Parallel execution is not complete: every acceptance criterion requires "
+                "valid verify-gate evidence."
+            )
+            final_message = completion_evidence_error
+
+        recoverable_failure_pause = None
+        if not success:
+            recoverable_failure_pause = self._recoverable_failure_pause_from_parallel_result(
+                parallel_result,
+                now=datetime.now(UTC),
+                require_all_failures_recoverable=not bool(
+                    getattr(parallel_result, "recoverable_route_pause", False)
+                ),
+                default_pause_seconds=execution_semantics["usage_limit_pause_seconds"],
+            )
 
         execution_summary = {
             "goal": seed.goal,
@@ -10542,7 +10561,7 @@ class OrchestratorRunner:
             "verification_report_sha256": hashlib.sha256(
                 verification_report.encode("utf-8")
             ).hexdigest(),
-            "task_results": [task_receipt(result) for result in parallel_result.results],
+            "task_results": [receipt.to_dict() for receipt in task_receipts],
             **self._task_summary(),
         }
 
@@ -10630,7 +10649,8 @@ class OrchestratorRunner:
                 session_id=tracker.session_id,
                 execution_id=exec_id,
                 requested_status=SessionStatus.FAILED,
-                error_message=(
+                error_message=completion_evidence_error
+                or (
                     "Partial failure: "
                     f"{parallel_result.failure_count} failed, "
                     f"{parallel_result.blocked_count} blocked, "

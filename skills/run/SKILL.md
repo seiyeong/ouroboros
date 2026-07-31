@@ -455,8 +455,8 @@ fallback instead of retrying the failing call.
    worker-written body is context only: durable typed task results and verify-gate
    evidence are the completion authority.
    A missing, malformed, or incomplete receipt, rejection, timeout, enqueue failure,
-   or missing final verdict terminates the parent Run job as `failed`; it must never
-   be reported as a completed run.
+   or missing final verdict terminates the Run as `failed`; the executor must not
+   publish an `execution.terminal` status of `completed` first.
    To skip: pass `skip_qa: true` to the tool.
 
    If the final run result meta contains `chained_evaluate_job_id`:

@@ -1214,7 +1214,7 @@ def test_sibling_flip_respects_gated_out(tmp_path: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_skip_completed_stamps_assumed_for_contract_less(tmp_path: Any) -> None:
+async def test_skip_completed_stamps_workspace_digest_for_contract_less(tmp_path: Any) -> None:
     from ouroboros.orchestrator.dependency_analyzer import ACNode, DependencyGraph
 
     seed = _seed_with_specs("plain AC")
@@ -1237,7 +1237,11 @@ async def test_skip_completed_stamps_assumed_for_contract_less(tmp_path: Any) ->
     )
 
     assert result.externally_satisfied_count == 1
-    assert "verification_status=assumed" in result.results[0].final_message
+    assert "verification_status=workspace_digest_verified" in result.results[0].final_message
+    verify_gate = result.results[0].verify_gate_outcome
+    assert verify_gate is not None
+    assert verify_gate.passed is True
+    assert verify_gate.workspace_digest is not None
 
 
 @pytest.mark.asyncio

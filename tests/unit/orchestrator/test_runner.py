@@ -951,6 +951,9 @@ class TestOrchestratorRunner:
         assert result.value.success is True
         # Parallel executor: 3 ACs × 3 messages each = 9 total
         assert result.value.messages_processed == 9
+        assert all(
+            task["verify_evidence"] is not None for task in result.value.summary["task_results"]
+        )
 
     @pytest.mark.asyncio
     async def test_execute_seed_retries_once_with_lateral_recovery_directive(
@@ -8384,6 +8387,80 @@ class TestOrchestratorRunner:
         assert captured_init["execution_profile"].suggested_model_tier is SuggestedModelTier.MEDIUM
         load_current_profile.assert_not_called()
         assert captured_execute["tools"] == ["Read", "mcp__chrome-devtools__click"]
+
+    @pytest.mark.asyncio
+    async def test_execute_parallel_rejects_completed_status_without_verify_gate_evidence(
+        self,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        from ouroboros.core.types import Result
+        from ouroboros.orchestrator.parallel_executor import (
+            ACExecutionResult,
+            ParallelExecutionResult,
+        )
+        from ouroboros.orchestrator.parallel_executor_models import ACExecutionOutcome
+
+        runner = OrchestratorRunner(MagicMock(), mock_event_store, mock_console)
+        tracker = SessionTracker.create("exec_parallel", sample_seed.metadata.seed_id)
+
+        class FakeParallelExecutor:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            async def execute_parallel(self, **kwargs: Any) -> ParallelExecutionResult:
+                return ParallelExecutionResult(
+                    results=tuple(
+                        ACExecutionResult(
+                            ac_index=index,
+                            ac_content=criterion,
+                            success=True,
+                            outcome=ACExecutionOutcome.SATISFIED_EXTERNALLY,
+                        )
+                        for index, criterion in enumerate(sample_seed.acceptance_criteria)
+                    ),
+                    success_count=0,
+                    externally_satisfied_count=len(sample_seed.acceptance_criteria),
+                    failure_count=0,
+                )
+
+        mark_completed = AsyncMock(return_value=Result.ok(None))
+        mark_failed = AsyncMock(return_value=Result.ok(None))
+        with (
+            patch(
+                "ouroboros.orchestrator.parallel_executor.ParallelACExecutor",
+                FakeParallelExecutor,
+            ),
+            patch.object(runner, "_check_cancellation", AsyncMock(return_value=False)),
+            patch.object(runner._session_repo, "mark_completed", mark_completed),
+            patch.object(runner._session_repo, "mark_failed", mark_failed),
+        ):
+            from ouroboros.orchestrator.mcp_tools import assemble_session_tool_catalog
+
+            result = await runner._execute_parallel(
+                seed=sample_seed,
+                exec_id="exec_parallel",
+                tracker=tracker,
+                merged_tools=["Read"],
+                tool_catalog=assemble_session_tool_catalog(["Read"]),
+                system_prompt="system",
+                start_time=datetime.now(UTC),
+                force_sequential_levels=True,
+            )
+
+        assert result.is_ok
+        assert result.value.success is False
+        mark_completed.assert_not_awaited()
+        mark_failed.assert_awaited_once()
+        terminal_events = [
+            call.args[0]
+            for call in mock_event_store.append.await_args_list
+            if call.args and call.args[0].type == "execution.terminal"
+        ]
+        assert terminal_events[-1].data["status"] == "failed"
+        assert "verify-gate evidence" in result.value.final_message
+        assert "Parallel Execution Complete" not in result.value.final_message
 
     @pytest.mark.asyncio
     async def test_execute_parallel_emits_verification_report_for_decomposed_acs(
