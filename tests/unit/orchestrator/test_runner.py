@@ -995,6 +995,7 @@ class TestOrchestratorRunner:
 
         assert result.is_ok
         assert result.value.success is False
+        assert "verification_report" not in result.value.summary
         mark_completed.assert_not_awaited()
         mark_failed.assert_awaited_once()
         terminal_events = [
@@ -6761,6 +6762,7 @@ class TestOrchestratorRunner:
 
         assert result.is_ok
         assert result.value.success is False
+        assert "verification_report" not in result.value.summary
         mark_completed.assert_not_awaited()
         mark_failed.assert_awaited_once()
         terminal_events = [
