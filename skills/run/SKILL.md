@@ -448,8 +448,10 @@ fallback instead of retrying the failing call.
    **not** the formal 3-stage evaluator. With `auto_evaluate: true` (the default),
    the parent Run job stays non-terminal while its bounded chained evaluator runs.
    It becomes `completed` only after the same-session `execution.terminal` holds a
-   canonical `Parallel Execution Verification Report` with an all-AC `Success`
-   count and `## Task Results`, and that evaluator returns `final_approved: true`.
+   canonical `Parallel Execution Verification Report` whose typed execution summary
+   shows every AC satisfied with no failed, blocked, invalid, or skipped result, and
+   whose `## Task Results` contains exactly one `[COMPLETED]` Task per AC; then the
+   evaluator must return `final_approved: true`.
    A missing, malformed, or incomplete receipt, rejection, timeout, enqueue failure,
    or missing final verdict terminates the parent Run job as `failed`; it must never
    be reported as a completed run.

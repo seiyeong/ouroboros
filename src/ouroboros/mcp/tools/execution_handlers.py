@@ -610,6 +610,78 @@ def _result_evaluation_working_dir(result: MCPToolResult, fallback: Path) -> Pat
     return fallback
 
 
+_CANONICAL_COMPLETED_TASK_HEADER_RE = re.compile(r"### Task (?P<index>[1-9]\d*): \[COMPLETED\] .+")
+_CANONICAL_NON_COMPLETED_RESULT_HEADER_RE = re.compile(
+    r"^#{3,6} (?:Task|Subtask) [1-9]\d*(?:\.[1-9]\d*)*: \[(?!COMPLETED\])",
+    flags=re.MULTILINE,
+)
+
+
+def _canonical_execution_receipt(summary: Mapping[str, Any]) -> str | None:
+    count_keys = (
+        "acceptance_criteria_count",
+        "success_count",
+        "externally_satisfied_count",
+        "satisfied_count",
+        "failure_count",
+        "blocked_count",
+        "invalid_count",
+        "skipped_count",
+    )
+    counts: dict[str, int] = {}
+    for key in count_keys:
+        value = summary.get(key)
+        if type(value) is not int or value < 0:
+            return None
+        counts[key] = value
+
+    total = counts["acceptance_criteria_count"]
+    if (
+        summary.get("parallel_execution") is not True
+        or total == 0
+        or counts["satisfied_count"] != total
+        or counts["success_count"] + counts["externally_satisfied_count"] != total
+        or any(
+            counts[key] != 0
+            for key in ("failure_count", "blocked_count", "invalid_count", "skipped_count")
+        )
+    ):
+        return None
+
+    verification_report = summary.get("verification_report")
+    if not isinstance(verification_report, str):
+        return None
+    canonical_report = verification_report.strip()
+    report_lines = canonical_report.splitlines()
+    expected_success_line = f"Success: {total}/{total}"
+    if (
+        len(report_lines) < 4
+        or report_lines[:2] != ["Parallel Execution Verification Report", expected_success_line]
+        or [line for line in report_lines if line.startswith("Success: ")]
+        != [expected_success_line]
+        or report_lines.count("## Task Results") != 1
+    ):
+        return None
+
+    task_results_start = report_lines.index("## Task Results")
+    task_lines = report_lines[task_results_start + 1 :]
+    if _CANONICAL_NON_COMPLETED_RESULT_HEADER_RE.search("\n".join(task_lines)) is not None:
+        return None
+    task_headers = [line for line in task_lines if line.startswith("### Task ")]
+    if len(task_headers) != total:
+        return None
+    task_indexes: set[int] = set()
+    for header in task_headers:
+        match = _CANONICAL_COMPLETED_TASK_HEADER_RE.fullmatch(header)
+        if match is None:
+            return None
+        task_indexes.add(int(match.group("index")))
+    if task_indexes != set(range(1, total + 1)):
+        return None
+
+    return canonical_report
+
+
 async def _chained_evaluation_artifact(
     event_store: EventStore,
     run_result: MCPToolResult,
@@ -640,24 +712,11 @@ async def _chained_evaluation_artifact(
         if data.get("session_id") != session_id or data.get("status") != "completed":
             continue
         summary = data.get("summary")
-        if not isinstance(summary, dict):
+        if not isinstance(summary, Mapping):
             continue
-        verification_report = summary.get("verification_report")
-        if isinstance(verification_report, str):
-            canonical_report = verification_report.strip()
-            success_match = re.search(
-                r"^Success: (?P<satisfied>\d+)/(?P<total>\d+)$",
-                canonical_report,
-                flags=re.MULTILINE,
-            )
-            if (
-                canonical_report.startswith("Parallel Execution Verification Report\n")
-                and success_match is not None
-                and int(success_match.group("satisfied")) == int(success_match.group("total"))
-                and int(success_match.group("total")) > 0
-                and "\n## Task Results\n" in canonical_report
-            ):
-                return "Run acceptance receipt:\n\n" + canonical_report
+        canonical_report = _canonical_execution_receipt(summary)
+        if canonical_report is not None:
+            return "Run acceptance receipt:\n\n" + canonical_report
     log.warning(
         "mcp.tool.start_execute_seed.chained_evaluate.receipt_missing",
         execution_id=execution_id,

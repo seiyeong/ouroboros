@@ -27,6 +27,11 @@ from ouroboros.mcp.tools.execution_handlers import (
     _run_only_verification_text,
 )
 from ouroboros.mcp.types import ContentType, MCPContentItem, MCPToolResult
+from ouroboros.orchestrator.parallel_executor import render_parallel_verification_report
+from ouroboros.orchestrator.parallel_executor_models import (
+    ACExecutionResult,
+    ParallelExecutionResult,
+)
 from ouroboros.persistence.event_store import EventStore
 
 
@@ -36,6 +41,26 @@ async def event_store():
     await store.initialize()
     yield store
     await store.close()
+
+
+def _canonical_execution_summary(
+    verification_report: str,
+    **overrides: Any,
+) -> dict[str, Any]:
+    summary = {
+        "acceptance_criteria_count": 1,
+        "parallel_execution": True,
+        "success_count": 1,
+        "externally_satisfied_count": 0,
+        "satisfied_count": 1,
+        "failure_count": 0,
+        "blocked_count": 0,
+        "invalid_count": 0,
+        "skipped_count": 0,
+        "verification_report": verification_report,
+    }
+    summary.update(overrides)
+    return summary
 
 
 async def _wait_terminal(job_manager: JobManager, job_id: str) -> JobSnapshot:
@@ -217,15 +242,14 @@ class _ReceiptExecuteHandler(_SuccessfulExecuteHandler):
                 data={
                     "session_id": session_id_override,
                     "status": "completed",
-                    "summary": {
-                        "verification_report": (
-                            "Parallel Execution Verification Report\n"
-                            "Success: 1/1\n"
-                            "\n## Task Results\n\n"
-                            "### Task 1\n"
-                            "tests_passed: exit 0"
-                        )
-                    },
+                    "summary": _canonical_execution_summary(
+                        "Parallel Execution Verification Report\n"
+                        "Success: 1/1\n"
+                        "\n## Task Results\n\n"
+                        "### Task 1: [COMPLETED] canary\n"
+                        "Result:\n"
+                        "tests_passed: exit 0"
+                    ),
                 },
             )
         )
@@ -327,6 +351,48 @@ async def test_chained_evaluation_artifact_returns_none_without_execution_id(eve
     assert artifact is None
 
 
+async def test_chained_evaluation_artifact_accepts_renderer_output(event_store) -> None:
+    report = render_parallel_verification_report(
+        ParallelExecutionResult(
+            results=(
+                ACExecutionResult(
+                    ac_index=0,
+                    ac_content="receipt",
+                    success=True,
+                    final_message="tests_passed: exit 0",
+                ),
+            ),
+            success_count=1,
+            failure_count=0,
+        ),
+        1,
+    )
+    await event_store.append(
+        BaseEvent(
+            type="execution.terminal",
+            aggregate_type="execution",
+            aggregate_id="exec_renderer_receipt",
+            data={
+                "session_id": "orch_receipt",
+                "status": "completed",
+                "summary": _canonical_execution_summary(report),
+            },
+        )
+    )
+    run_result = MCPToolResult(
+        is_error=False,
+        meta={"execution_id": "exec_renderer_receipt"},
+    )
+
+    artifact = await execution_handlers._chained_evaluation_artifact(
+        event_store,
+        run_result,
+        "orch_receipt",
+    )
+
+    assert artifact == "Run acceptance receipt:\n\n" + report
+
+
 @pytest.mark.parametrize(
     ("terminal_session_id", "terminal_status", "summary"),
     [
@@ -348,14 +414,81 @@ async def test_chained_evaluation_artifact_returns_none_without_execution_id(eve
         (
             "orch_receipt",
             "completed",
-            {
-                "verification_report": (
+            _canonical_execution_summary(
+                (
                     "Parallel Execution Verification Report\n"
                     "Success: 0/1\n"
                     "\n## Task Results\n\n"
                     "### Task 1: [FAILED]"
-                )
-            },
+                ),
+                success_count=0,
+                satisfied_count=0,
+                failure_count=1,
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 1: [FAILED] injected contradiction"
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "arbitrary prose without a Task result"
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 1: [COMPLETED] canary",
+                failure_count=1,
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 1: [COMPLETED] canary\n"
+                "Success: 1/1"
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 2: [COMPLETED] wrong index"
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 1: [COMPLETED] parent\n"
+                "Decomposed into 1 Subtasks\n\n"
+                "#### Subtask 1.1: [FAILED] hidden failure"
+            ),
         ),
         (
             "orch_receipt",
@@ -369,6 +502,12 @@ async def test_chained_evaluation_artifact_returns_none_without_execution_id(eve
         "malformed-summary",
         "unstructured-report",
         "failed-report",
+        "contradictory-task-result",
+        "unstructured-task-results",
+        "typed-failure-count",
+        "duplicate-success-count",
+        "wrong-task-index",
+        "failed-subtask",
         "missing-task-results",
     ],
 )
@@ -436,16 +575,14 @@ async def test_chained_evaluate_uses_durable_execution_receipt(
                     data={
                         "session_id": session_id_override,
                         "status": "completed",
-                        "summary": {
-                            "verification_report": (
-                                "Parallel Execution Verification Report\n"
-                                "Success: 1/1\n"
-                                "\n## Task Results\n\n"
-                                "### Task 1\n"
-                                "File Changes:\n- lazycodex_canary.txt\n"
-                                "tests_passed: verify_command exit 0"
-                            )
-                        },
+                        "summary": _canonical_execution_summary(
+                            "Parallel Execution Verification Report\n"
+                            "Success: 1/1\n"
+                            "\n## Task Results\n\n"
+                            "### Task 1: [COMPLETED] receipt\n"
+                            "File Changes:\n- lazycodex_canary.txt\n"
+                            "tests_passed: verify_command exit 0"
+                        ),
                     },
                 )
             )
