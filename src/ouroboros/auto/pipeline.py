@@ -7,7 +7,9 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+import hashlib
 import inspect
+import json
 import re
 import threading
 import time
@@ -2857,8 +2859,15 @@ class AutoPipeline:
             state.last_qa_score = float(qa_result.score)
             state.last_qa_verdict = _safe_seed_qa_verdict(qa_result.verdict)
             state.last_qa_passed = bool(qa_result.passed)
-            state.last_qa_differences = _safe_seed_qa_evidence(qa_result.differences)
-            state.last_qa_suggestions = _safe_seed_qa_evidence(qa_result.suggestions)
+            recovery_fingerprint = _seed_qa_recovery_fingerprint(qa_result)
+            state.last_qa_differences = _safe_seed_qa_evidence(
+                qa_result.differences,
+                recovery_fingerprint=recovery_fingerprint,
+            )
+            state.last_qa_suggestions = _safe_seed_qa_evidence(
+                qa_result.suggestions,
+                recovery_fingerprint=recovery_fingerprint,
+            )
             if qa_result.passed:
                 review_blocker = self._seed_review_gate_blocker(state, current_review)
                 if review_blocker is not None:
@@ -2894,6 +2903,7 @@ class AutoPipeline:
                             "attempts": attempt,
                             "verdict": state.last_qa_verdict,
                             "score": float(qa_result.score),
+                            "recovery_fingerprint": recovery_fingerprint,
                             "differences": state.last_qa_differences[:5],
                             "suggestions": state.last_qa_suggestions[:5],
                             "reason": "seed_qa_feedback_unmapped",
@@ -2958,6 +2968,7 @@ class AutoPipeline:
                     "attempts": attempt,
                     "verdict": state.last_qa_verdict,
                     "score": float(qa_result.score),
+                    "recovery_fingerprint": recovery_fingerprint,
                     "differences": state.last_qa_differences[:5],
                     "suggestions": state.last_qa_suggestions[:5],
                     "reason": "repair_budget_exhausted",
@@ -5150,11 +5161,31 @@ def _requests_seed_qa_ambiguity_repair(qa_result: EvaluateResult) -> bool:
     return False
 
 
-def _safe_seed_qa_evidence(feedback: tuple[str, ...]) -> list[str]:
+def _seed_qa_recovery_fingerprint(qa_result: EvaluateResult) -> str:
+    """Hash the bounded QA shape without persisting reviewer or prompt text."""
+    payload = json.dumps(
+        {
+            "differences": [item.strip() for item in qa_result.differences[:5] if item.strip()],
+            "schema_version": 1,
+            "suggestions": [item.strip() for item in qa_result.suggestions[:5] if item.strip()],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"sha256:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+def _safe_seed_qa_evidence(
+    feedback: tuple[str, ...], *, recovery_fingerprint: str
+) -> list[str]:
     count = len(feedback[:5])
     if count == 0:
         return []
-    return [f"{count} Seed QA feedback item(s) withheld from durable state"]
+    return [
+        f"{count} Seed QA feedback item(s) withheld from durable state; "
+        f"recovery_fingerprint={recovery_fingerprint}"
+    ]
 
 
 def _safe_seed_qa_verdict(verdict: str) -> str:

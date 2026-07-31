@@ -1755,6 +1755,15 @@ async def test_pipeline_blocks_run_when_seed_qa_does_not_pass(tmp_path) -> None:
     assert state.last_tool_name == "seed_qa"
     assert state.last_error_code == "seed_qa_feedback_unmapped"
     assert state.last_qa_score == 0.58
+    assert state.last_qa_differences == [
+        "1 Seed QA feedback item(s) withheld from durable state; "
+        "recovery_fingerprint=sha256:c7bde65010b2f8ec9ec218f44f1f7c67c8f5fa3dff7061d28dd79a0b83f960ea"
+    ]
+    assert state.last_qa_suggestions == [
+        "1 Seed QA feedback item(s) withheld from durable state; "
+        "recovery_fingerprint=sha256:c7bde65010b2f8ec9ec218f44f1f7c67c8f5fa3dff7061d28dd79a0b83f960ea"
+    ]
+    assert "missing interview nuance" not in str(state.to_dict())
 
 
 @pytest.mark.asyncio
