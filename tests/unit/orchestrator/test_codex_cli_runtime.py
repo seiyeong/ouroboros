@@ -62,6 +62,30 @@ def test_codex_config_fingerprint_ignores_automatic_project_trust(
     assert runtime._fingerprint_codex_config_files() == original
 
 
+def test_codex_config_fingerprint_ignores_concurrent_worktree_project_bookkeeping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text('model = "gpt-test"\n', encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    runtime = CodexCliRuntime(cli_path="codex", cwd="/tmp/project")
+    original = runtime._codex_config_fingerprint
+
+    config_path.write_text(
+        (
+            'model = "gpt-test"\n\n[projects."/tmp/other-worktree"]\n'
+            'trust_level = "trusted"\nlast_opened = "2026-07-31"\n'
+        ),
+        encoding="utf-8",
+    )
+
+    assert runtime._fingerprint_codex_config_files() == original
+    runtime._assert_codex_config_files_unchanged()
+
+
 def test_codex_config_fingerprint_still_detects_project_runtime_overrides(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

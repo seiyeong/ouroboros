@@ -17,7 +17,7 @@ import re
 import shlex
 import tempfile
 import tomllib
-from typing import Any
+from typing import Any, ClassVar
 
 from ouroboros.codex.cli_policy import (
     DEFAULT_CODEX_CHILD_SESSION_ENV_KEYS,
@@ -532,14 +532,20 @@ class CodexCliRuntime:
             digest.update(b"\0")
         return digest.hexdigest()
 
+    _CODEX_PROJECT_BOOKKEEPING_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {"trust_level", "trusted", "last_opened", "last_opened_at", "last_used", "last_used_at"}
+    )
+
     @staticmethod
     def _stable_global_codex_config_bytes(contents: bytes) -> bytes:
         """Ignore Codex's automatic per-cwd trust bookkeeping in drift checks.
 
-        ``codex exec`` adds ``projects.<cwd>.trust_level`` on first use. That
-        mutation cannot retarget a model/profile and must not invalidate the
-        thread handle created by the same command. Any other project-scoped key
-        remains fingerprinted, as do all non-project settings.
+        ``codex exec`` records per-cwd bookkeeping such as
+        ``projects.<cwd>.trust_level`` on first use, and every isolated task
+        worktree is a new cwd. Those writes cannot retarget a model/profile and
+        must not invalidate a run that is already executing. Any other
+        project-scoped key remains fingerprinted, as do all non-project
+        settings.
         """
         try:
             parsed = tomllib.loads(contents.decode("utf-8"))
@@ -554,7 +560,9 @@ class CodexCliRuntime:
                     retained_projects[str(project_path)] = raw_settings
                     continue
                 retained_settings = {
-                    str(key): value for key, value in raw_settings.items() if key != "trust_level"
+                    str(key): value
+                    for key, value in raw_settings.items()
+                    if str(key) not in CodexCliRuntime._CODEX_PROJECT_BOOKKEEPING_KEYS
                 }
                 if retained_settings:
                     retained_projects[str(project_path)] = retained_settings
