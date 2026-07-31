@@ -35,3 +35,13 @@ class TestDetectBrownfield:
         """Accepts string paths in addition to Path objects."""
         (tmp_path / "Cargo.toml").write_text("[package]\nname = 'demo'\n")
         assert detect_brownfield(str(tmp_path)) is True
+
+    def test_detect_brownfield_with_git_directory_only(self, tmp_path: Path) -> None:
+        (tmp_path / ".git").mkdir()
+
+        assert detect_brownfield(tmp_path) is True
+
+    def test_detect_brownfield_with_linked_worktree_marker(self, tmp_path: Path) -> None:
+        (tmp_path / ".git").write_text("gitdir: /tmp/example/worktrees/demo\n")
+
+        assert detect_brownfield(tmp_path) is True

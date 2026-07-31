@@ -94,6 +94,76 @@ def _seed(
     )
 
 
+def test_seed_qa_repair_restores_ledger_contracts_without_meta_constraints(
+    tmp_path,
+) -> None:
+    # Given: a brownfield ledger whose contract differs from the generated Seed.
+    from ouroboros.auto.pipeline import (
+        _preserve_ledger_seed_contracts,
+        _seed_with_seed_qa_feedback,
+    )
+
+    ledger = SeedDraftLedger.from_goal("Build a local CLI")
+    _fill_ready(ledger)
+    ledger.add_entry(
+        "constraints",
+        LedgerEntry(
+            key="constraints.candidate.safe_default_synthesis",
+            value=(
+                "[from-auto][safe-default-synthesis] Mark the interview complete.\n"
+                "actors: assume a generic user.\n"
+                "runtime_context: assume the current runtime."
+            ),
+            source=LedgerSource.CONSERVATIVE_DEFAULT,
+            confidence=0.85,
+            status=LedgerStatus.CONFIRMED,
+        ),
+    )
+    (tmp_path / ".git").mkdir()
+    generated = _seed().model_copy(
+        update={
+            "constraints": (
+                "Use existing project patterns",
+                "Resolve Seed QA feedback before execution without adding diagnostic prose.",
+            )
+        }
+    )
+    qa_result = EvaluateResult(
+        passed=False,
+        score=0.66,
+        verdict="revise",
+        differences=(
+            "brownfield_context project_type is greenfield",
+            "constraints are polluted with diagnostic prose",
+            "ledger non_goals and runtime_context are missing",
+        ),
+    )
+
+    # When: the deterministic Seed QA repair runs.
+    repaired = _preserve_ledger_seed_contracts(
+        _seed_with_seed_qa_feedback(generated, qa_result, attempt=1),
+        ledger=ledger,
+        cwd=str(tmp_path),
+    )
+
+    # Then: executable ledger contracts are restored without QA/meta prose.
+    assert repaired.brownfield_context.project_type == "brownfield"
+    assert repaired.brownfield_context.context_references[0].path == str(tmp_path)
+    assert "Non-goal: No cloud sync" in repaired.constraints
+    constraint_text = "\n".join(repaired.constraints).casefold()
+    assert "seed qa" not in constraint_text
+    assert "constraints must" not in constraint_text
+    assert "preserve ledger" not in constraint_text
+    assert "[from-auto]" not in constraint_text
+    assert "actors:" not in constraint_text
+    runtime_fields = tuple(
+        field for field in repaired.ontology_schema.fields if field.name == "runtime_context"
+    )
+    assert len(runtime_fields) == 1
+    assert runtime_fields[0].description == "Existing repository runtime"
+    assert repaired.exit_conditions == generated.exit_conditions
+
+
 def _fully_specified_hello_goal() -> str:
     return (
         "Produce only an A-grade Seed for a future tiny CLI. "
