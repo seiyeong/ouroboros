@@ -490,7 +490,7 @@ Output a structured summary with sections: Tech Stack, Key Types, Patterns, Conv
 def detect_brownfield(cwd: str | Path) -> bool:
     """Detect whether a directory is a brownfield project.
 
-    Checks for the presence of any recognised config file from ``_CONFIG_FILES``.
+    Checks for a Git repository/worktree marker or a recognised config file.
 
     Args:
         cwd: Directory to inspect.
@@ -500,7 +500,9 @@ def detect_brownfield(cwd: str | Path) -> bool:
     """
     try:
         root = Path(cwd)
-        return any((root / name).exists() for name in _CONFIG_FILES)
+        return root.is_dir() and (
+            (root / ".git").exists() or any((root / name).exists() for name in _CONFIG_FILES)
+        )
     except Exception:
         return False
 
