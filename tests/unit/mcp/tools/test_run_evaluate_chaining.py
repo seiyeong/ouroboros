@@ -217,7 +217,15 @@ class _ReceiptExecuteHandler(_SuccessfulExecuteHandler):
                 data={
                     "session_id": session_id_override,
                     "status": "completed",
-                    "summary": {"verification_report": "Success: 1/1\ntests_passed: exit 0"},
+                    "summary": {
+                        "verification_report": (
+                            "Parallel Execution Verification Report\n"
+                            "Success: 1/1\n"
+                            "\n## Task Results\n\n"
+                            "### Task 1\n"
+                            "tests_passed: exit 0"
+                        )
+                    },
                 },
             )
         )
@@ -322,11 +330,47 @@ async def test_chained_evaluation_artifact_returns_none_without_execution_id(eve
 @pytest.mark.parametrize(
     ("terminal_session_id", "terminal_status", "summary"),
     [
-        ("orch_other", "completed", {"verification_report": "Success: 1/1"}),
+        (
+            "orch_other",
+            "completed",
+            {
+                "verification_report": (
+                    "Parallel Execution Verification Report\n"
+                    "Success: 1/1\n"
+                    "\n## Task Results\n\n"
+                    "### Task 1"
+                )
+            },
+        ),
         ("orch_receipt", "completed", {"verification_report": "  \n"}),
         ("orch_receipt", "completed", "not a receipt mapping"),
+        ("orch_receipt", "completed", {"verification_report": "garbage"}),
+        (
+            "orch_receipt",
+            "completed",
+            {
+                "verification_report": (
+                    "Parallel Execution Verification Report\n"
+                    "Success: 0/1\n"
+                    "\n## Task Results\n\n"
+                    "### Task 1: [FAILED]"
+                )
+            },
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            {"verification_report": "Parallel Execution Verification Report\nSuccess: 1/1"},
+        ),
     ],
-    ids=["session-mismatch", "empty-report", "malformed-summary"],
+    ids=[
+        "session-mismatch",
+        "empty-report",
+        "malformed-summary",
+        "unstructured-report",
+        "failed-report",
+        "missing-task-results",
+    ],
 )
 async def test_chained_evaluation_artifact_requires_matching_nonempty_receipt(
     event_store,
@@ -394,7 +438,10 @@ async def test_chained_evaluate_uses_durable_execution_receipt(
                         "status": "completed",
                         "summary": {
                             "verification_report": (
+                                "Parallel Execution Verification Report\n"
                                 "Success: 1/1\n"
+                                "\n## Task Results\n\n"
+                                "### Task 1\n"
                                 "File Changes:\n- lazycodex_canary.txt\n"
                                 "tests_passed: verify_command exit 0"
                             )

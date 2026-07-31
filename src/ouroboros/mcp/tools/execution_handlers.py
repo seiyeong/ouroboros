@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 import inspect
 import os
 from pathlib import Path
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -642,8 +643,21 @@ async def _chained_evaluation_artifact(
         if not isinstance(summary, dict):
             continue
         verification_report = summary.get("verification_report")
-        if isinstance(verification_report, str) and verification_report.strip():
-            return "Run acceptance receipt:\n\n" + verification_report.strip()
+        if isinstance(verification_report, str):
+            canonical_report = verification_report.strip()
+            success_match = re.search(
+                r"^Success: (?P<satisfied>\d+)/(?P<total>\d+)$",
+                canonical_report,
+                flags=re.MULTILINE,
+            )
+            if (
+                canonical_report.startswith("Parallel Execution Verification Report\n")
+                and success_match is not None
+                and int(success_match.group("satisfied")) == int(success_match.group("total"))
+                and int(success_match.group("total")) > 0
+                and "\n## Task Results\n" in canonical_report
+            ):
+                return "Run acceptance receipt:\n\n" + canonical_report
     log.warning(
         "mcp.tool.start_execute_seed.chained_evaluate.receipt_missing",
         execution_id=execution_id,

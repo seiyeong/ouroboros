@@ -447,9 +447,12 @@ fallback instead of retrying the failing call.
    The QA verdict is included in the final job result text. This QA check is
    **not** the formal 3-stage evaluator. With `auto_evaluate: true` (the default),
    the parent Run job stays non-terminal while its bounded chained evaluator runs.
-   It becomes `completed` only after that evaluator returns `final_approved: true`.
-   A rejection, timeout, enqueue failure, or missing final verdict terminates the
-   parent Run job as `failed`; it must never be reported as a completed run.
+   It becomes `completed` only after the same-session `execution.terminal` holds a
+   canonical `Parallel Execution Verification Report` with an all-AC `Success`
+   count and `## Task Results`, and that evaluator returns `final_approved: true`.
+   A missing, malformed, or incomplete receipt, rejection, timeout, enqueue failure,
+   or missing final verdict terminates the parent Run job as `failed`; it must never
+   be reported as a completed run.
    To skip: pass `skip_qa: true` to the tool.
 
    If the final run result meta contains `chained_evaluate_job_id`:
