@@ -430,10 +430,12 @@ class ExecutionTaskReceipt:
 def _verify_evidence_from_gate(
     verify_gate_outcome: _VerifyGateOutcome | None,
 ) -> ExecutionVerifyEvidence | None:
+    from ouroboros.orchestrator.parallel_executor import _VerifyGateOutcome
+
     if (
-        verify_gate_outcome is None
+        not isinstance(verify_gate_outcome, _VerifyGateOutcome)
         or verify_gate_outcome.passed is not True
-        or verify_gate_outcome.workspace_mutated
+        or verify_gate_outcome.workspace_mutated is not False
     ):
         return None
     workspace_digest = verify_gate_outcome.workspace_digest
@@ -448,17 +450,69 @@ def _verify_evidence_from_gate(
 def _completion_receipts_verified(
     task_receipts: tuple[ExecutionTaskReceipt, ...],
     expected_count: int,
+    *,
+    allow_external_satisfaction: bool = True,
 ) -> bool:
+    accepted_outcomes = (
+        frozenset({"succeeded", "satisfied_externally"})
+        if allow_external_satisfaction
+        else frozenset({"succeeded"})
+    )
     return (
-        len(task_receipts) == expected_count
+        expected_count > 0
+        and len(task_receipts) == expected_count
         and {receipt.ac_index for receipt in task_receipts} == set(range(expected_count))
         and all(
-            receipt.outcome in {"succeeded", "satisfied_externally"}
+            receipt.outcome in accepted_outcomes
             and receipt.success is True
             and receipt.verify_evidence is not None
             for receipt in task_receipts
         )
     )
+
+
+@dataclass(frozen=True, slots=True)
+class DirectCompletionReceipt:
+    goal: str
+    acceptance_criteria_count: int
+    task_receipts: tuple[ExecutionTaskReceipt, ...]
+    verification_report: str
+
+    def is_verified(self) -> bool:
+        return _completion_receipts_verified(
+            self.task_receipts,
+            self.acceptance_criteria_count,
+            allow_external_satisfaction=False,
+        )
+
+    def to_summary(
+        self,
+        *,
+        final_message: str,
+        messages_processed: int,
+        task_summary: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "goal": self.goal,
+            "acceptance_criteria_count": self.acceptance_criteria_count,
+            "parallel_execution": False,
+            "execution_mode": "direct",
+            "success_count": self.acceptance_criteria_count,
+            "externally_satisfied_count": 0,
+            "satisfied_count": self.acceptance_criteria_count,
+            "failure_count": 0,
+            "blocked_count": 0,
+            "invalid_count": 0,
+            "skipped_count": 0,
+            "verification_report": self.verification_report,
+            "verification_report_sha256": hashlib.sha256(
+                self.verification_report.encode("utf-8")
+            ).hexdigest(),
+            "task_results": [receipt.to_dict() for receipt in self.task_receipts],
+            "final_message": final_message[:500],
+            "messages_processed": messages_processed,
+            **task_summary,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -3368,6 +3422,99 @@ class OrchestratorRunner:
                 },
             )
         return required_cwd or provider_cwd
+
+    async def _build_direct_completion_receipt(
+        self,
+        *,
+        seed: Seed,
+        runtime_handle: RuntimeHandle | None,
+        execution_semantics: Mapping[str, Any],
+    ) -> DirectCompletionReceipt:
+        total_acceptance_criteria = len(seed.acceptance_criteria)
+        if execution_semantics["run_verify_commands"]:
+            from ouroboros.orchestrator.parallel_executor import (
+                _FOUNDATION_A_ENTRY_RUN_AC_VERIFY_GATE,
+                ParallelACExecutor,
+                _invoke_execution_authority_entry,
+            )
+
+            direct_cwd = (
+                self._effective_cwd(runtime_handle)
+                or self._adapter.working_directory
+                or os.getcwd()
+            )
+            direct_verify_executor = ParallelACExecutor(
+                adapter=self._adapter,
+                event_store=self._event_store,
+                console=self._console,
+                enable_decomposition=False,
+                task_cwd=direct_cwd,
+                run_verify_commands=True,
+                verify_command_timeout_seconds=execution_semantics[
+                    "verify_command_timeout_seconds"
+                ],
+                expected_runtime_effect_capabilities=execution_semantics[
+                    "runtime_effect_capabilities"
+                ],
+            )
+            verified_receipts: list[ExecutionTaskReceipt] = []
+            for index, criterion in enumerate(seed.acceptance_criteria):
+                verification_spec = (
+                    criterion
+                    if isinstance(criterion, AcceptanceCriterionSpec)
+                    else AcceptanceCriterionSpec(description=ac_text(criterion))
+                )
+                verify_gate_outcome = await _invoke_execution_authority_entry(
+                    direct_verify_executor,
+                    _FOUNDATION_A_ENTRY_RUN_AC_VERIFY_GATE,
+                    spec=verification_spec,
+                    cwd=direct_cwd,
+                )
+                verified_receipts.append(
+                    ExecutionTaskReceipt(
+                        ac_index=index,
+                        outcome="succeeded",
+                        success=True,
+                        verify_evidence=_verify_evidence_from_gate(verify_gate_outcome),
+                    )
+                )
+            task_receipts = tuple(verified_receipts)
+        else:
+            task_receipts = tuple(
+                ExecutionTaskReceipt(
+                    ac_index=index,
+                    outcome="failed",
+                    success=False,
+                    verify_evidence=None,
+                )
+                for index, _criterion in enumerate(seed.acceptance_criteria)
+            )
+        verified_count = sum(
+            receipt.outcome == "succeeded"
+            and receipt.success is True
+            and receipt.verify_evidence is not None
+            for receipt in task_receipts
+        )
+        report_lines = [
+            "Direct Execution Verification Report",
+            f"Success: {verified_count}/{total_acceptance_criteria}",
+            "",
+            "## Task Results",
+        ]
+        report_lines.extend(
+            (
+                f"- Task {receipt.ac_index + 1}: "
+                f"[{'COMPLETED' if receipt.outcome == 'succeeded' and receipt.success is True and receipt.verify_evidence is not None else 'FAILED'}] "
+                f"outcome={receipt.outcome}"
+            )
+            for receipt in task_receipts
+        )
+        return DirectCompletionReceipt(
+            goal=seed.goal,
+            acceptance_criteria_count=total_acceptance_criteria,
+            task_receipts=task_receipts,
+            verification_report="\n".join(report_lines),
+        )
 
     @staticmethod
     def _canonical_path(value: str) -> str:
@@ -9885,83 +10032,14 @@ class OrchestratorRunner:
             durable_terminal_status: SessionStatus | None = None
             completion_summary: dict[str, Any] | None = None
             acceptance_finalizations: list[dict[str, Any]] | None = None
-            direct_task_receipts: tuple[ExecutionTaskReceipt, ...] = ()
-            direct_verification_report = ""
+            direct_completion_receipt: DirectCompletionReceipt | None = None
             if success:
-                total_acceptance_criteria = len(seed.acceptance_criteria)
-                if execution_semantics["run_verify_commands"]:
-                    from ouroboros.orchestrator.parallel_executor import (
-                        _FOUNDATION_A_ENTRY_RUN_AC_VERIFY_GATE,
-                        ParallelACExecutor,
-                        _invoke_execution_authority_entry,
-                    )
-
-                    direct_cwd = (
-                        self._effective_cwd(runtime_handle)
-                        or self._adapter.working_directory
-                        or os.getcwd()
-                    )
-                    direct_verify_executor = ParallelACExecutor(
-                        adapter=self._adapter,
-                        event_store=self._event_store,
-                        console=self._console,
-                        enable_decomposition=False,
-                        task_cwd=direct_cwd,
-                        run_verify_commands=True,
-                        verify_command_timeout_seconds=execution_semantics[
-                            "verify_command_timeout_seconds"
-                        ],
-                        expected_runtime_effect_capabilities=execution_semantics[
-                            "runtime_effect_capabilities"
-                        ],
-                    )
-                    verified_receipts: list[ExecutionTaskReceipt] = []
-                    for index, criterion in enumerate(seed.acceptance_criteria):
-                        verification_spec = (
-                            criterion
-                            if isinstance(criterion, AcceptanceCriterionSpec)
-                            else AcceptanceCriterionSpec(description=ac_text(criterion))
-                        )
-                        verify_gate_outcome = await _invoke_execution_authority_entry(
-                            direct_verify_executor,
-                            _FOUNDATION_A_ENTRY_RUN_AC_VERIFY_GATE,
-                            spec=verification_spec,
-                            cwd=direct_cwd,
-                        )
-                        verified_receipts.append(
-                            ExecutionTaskReceipt(
-                                ac_index=index,
-                                outcome="succeeded",
-                                success=True,
-                                verify_evidence=_verify_evidence_from_gate(verify_gate_outcome),
-                            )
-                        )
-                    direct_task_receipts = tuple(verified_receipts)
-                else:
-                    direct_task_receipts = tuple(
-                        ExecutionTaskReceipt(
-                            ac_index=index,
-                            outcome="succeeded",
-                            success=True,
-                            verify_evidence=None,
-                        )
-                        for index, _criterion in enumerate(seed.acceptance_criteria)
-                    )
-                report_lines = [
-                    "Direct Execution Verification Report",
-                    f"Success: {total_acceptance_criteria}/{total_acceptance_criteria}",
-                    "",
-                    "## Task Results",
-                ]
-                report_lines.extend(
-                    f"- Task {receipt.ac_index + 1}: [COMPLETED] outcome={receipt.outcome}"
-                    for receipt in direct_task_receipts
+                direct_completion_receipt = await self._build_direct_completion_receipt(
+                    seed=seed,
+                    runtime_handle=runtime_handle,
+                    execution_semantics=execution_semantics,
                 )
-                direct_verification_report = "\n".join(report_lines)
-                if not _completion_receipts_verified(
-                    direct_task_receipts,
-                    total_acceptance_criteria,
-                ):
+                if not direct_completion_receipt.is_verified():
                     success = False
                     final_message = (
                         "Direct execution is not complete: every acceptance criterion requires "
@@ -9969,27 +10047,12 @@ class OrchestratorRunner:
                     )
 
             if success:
-                completion_summary = {
-                    "goal": seed.goal,
-                    "acceptance_criteria_count": len(seed.acceptance_criteria),
-                    "parallel_execution": False,
-                    "execution_mode": "direct",
-                    "success_count": len(seed.acceptance_criteria),
-                    "externally_satisfied_count": 0,
-                    "satisfied_count": len(seed.acceptance_criteria),
-                    "failure_count": 0,
-                    "blocked_count": 0,
-                    "invalid_count": 0,
-                    "skipped_count": 0,
-                    "verification_report": direct_verification_report,
-                    "verification_report_sha256": hashlib.sha256(
-                        direct_verification_report.encode("utf-8")
-                    ).hexdigest(),
-                    "task_results": [receipt.to_dict() for receipt in direct_task_receipts],
-                    "final_message": final_message[:500],
-                    "messages_processed": messages_processed,
-                    **self._task_summary(),
-                }
+                assert direct_completion_receipt is not None
+                completion_summary = direct_completion_receipt.to_summary(
+                    final_message=final_message,
+                    messages_processed=messages_processed,
+                    task_summary=self._task_summary(),
+                )
                 acceptance_finalizations = self._build_terminal_acceptance_finalizations(
                     seed=seed,
                     parallel_result=None,
@@ -11943,8 +12006,29 @@ Note: This is a resumed session. Please continue from where execution was interr
             duration = (datetime.now(UTC) - start_time).total_seconds()
 
             durable_terminal_status: SessionStatus | None = None
+            completion_summary: dict[str, Any] | None = None
             acceptance_finalizations: list[dict[str, Any]] | None = None
+            direct_completion_receipt: DirectCompletionReceipt | None = None
             if success:
+                direct_completion_receipt = await self._build_direct_completion_receipt(
+                    seed=seed,
+                    runtime_handle=live_runtime_handle,
+                    execution_semantics=execution_semantics,
+                )
+                if not direct_completion_receipt.is_verified():
+                    success = False
+                    final_message = (
+                        "Direct execution is not complete: every acceptance criterion requires "
+                        "valid verify-gate evidence."
+                    )
+
+            if success:
+                assert direct_completion_receipt is not None
+                completion_summary = direct_completion_receipt.to_summary(
+                    final_message=final_message,
+                    messages_processed=messages_processed,
+                    task_summary=self._task_summary(),
+                )
                 acceptance_finalizations = self._build_terminal_acceptance_finalizations(
                     seed=seed,
                     parallel_result=None,
@@ -11959,10 +12043,7 @@ Note: This is a resumed session. Please continue from where execution was interr
                     session_id=session_id,
                     execution_id=tracker.execution_id,
                     requested_status=SessionStatus.COMPLETED,
-                    summary={
-                        "messages_processed": messages_processed,
-                        **self._task_summary(),
-                    },
+                    summary=completion_summary,
                     messages_processed=messages_processed,
                     acceptance_finalizations=acceptance_finalizations,
                 )
@@ -12069,6 +12150,9 @@ Note: This is a resumed session. Please continue from where execution was interr
                 execution_id=tracker.execution_id,
                 session_id=session_id,
                 status=terminal_status,
+                summary=completion_summary
+                if terminal_status == SessionStatus.COMPLETED.value
+                else None,
                 error_message=(
                     final_message
                     if terminal_status

@@ -460,6 +460,23 @@ async def test_chained_evaluation_artifact_accepts_direct_receipt(event_store) -
     assert "## Durable Task Receipt" in artifact
 
 
+def test_canonical_execution_receipt_rejects_unlabeled_direct_mode() -> None:
+    report = "\n".join(
+        (
+            "Direct Execution Verification Report",
+            "Success: 1/1",
+            "",
+            "## Task Results",
+        )
+    )
+
+    receipt = execution_handlers._canonical_execution_receipt(
+        _canonical_execution_summary(report, parallel_execution=False)
+    )
+
+    assert receipt is None
+
+
 async def test_chained_evaluation_artifact_rejects_direct_external_receipt(event_store) -> None:
     report = "\n".join(
         (
