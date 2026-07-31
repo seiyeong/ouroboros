@@ -7,7 +7,9 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+import hashlib
 import inspect
+import json
 import re
 import threading
 import time
@@ -110,6 +112,15 @@ _RECOVERY_BLOCKED_CHOICES: str = (
     "next: (1) re-interview with a refined goal (the in-state Seed cannot "
     "be edited mid-session); (2) abandon this session"
 )
+
+
+class SeedQaRepairMappingError(RuntimeError):
+    def __init__(self, feedback: tuple[str, ...]) -> None:
+        self.feedback: tuple[str, ...] = feedback
+        super().__init__(
+            "Seed QA feedback could not be mapped to a bounded repair; "
+            "manual Seed revision is required"
+        )
 
 
 class SeedGenerator(Protocol):
@@ -2843,10 +2854,17 @@ class AutoPipeline:
                 )
 
             state.last_qa_score = float(qa_result.score)
-            state.last_qa_verdict = str(qa_result.verdict)
+            state.last_qa_verdict = _safe_seed_qa_verdict(qa_result.verdict)
             state.last_qa_passed = bool(qa_result.passed)
-            state.last_qa_differences = list(qa_result.differences)
-            state.last_qa_suggestions = list(qa_result.suggestions)
+            recovery_fingerprint = _seed_qa_recovery_fingerprint(qa_result)
+            state.last_qa_differences = _safe_seed_qa_evidence(
+                qa_result.differences,
+                recovery_fingerprint=recovery_fingerprint,
+            )
+            state.last_qa_suggestions = _safe_seed_qa_evidence(
+                qa_result.suggestions,
+                recovery_fingerprint=recovery_fingerprint,
+            )
             if qa_result.passed:
                 review_blocker = self._seed_review_gate_blocker(state, current_review)
                 if review_blocker is not None:
@@ -2858,22 +2876,53 @@ class AutoPipeline:
                         current_review,
                     )
                 state.mark_progress(
-                    f"Seed QA passed: {qa_result.verdict} (score {qa_result.score:.2f})",
+                    f"Seed QA passed: {state.last_qa_verdict} (score {qa_result.score:.2f})",
                     tool_name="seed_qa",
                 )
                 self._save(state)
                 return None, current_seed, current_review
 
             if attempt < max_attempts:
-                current_seed = normalize_execution_acceptance(
-                    _preserve_ledger_seed_contracts(
-                        await self._repair_seed_after_qa(
-                            state, current_seed, qa_result, attempt=attempt
-                        ),
-                        ledger=ledger,
-                        cwd=state.cwd,
+                try:
+                    current_seed = normalize_execution_acceptance(
+                        _preserve_ledger_seed_contracts(
+                            await self._repair_seed_after_qa(
+                                state, current_seed, qa_result, attempt=attempt
+                            ),
+                            ledger=ledger,
+                            cwd=state.cwd,
+                        )
                     )
-                )
+                except SeedQaRepairMappingError as exc:
+                    await self._emit_runtime_event(
+                        "auto.seed_qa.blocked",
+                        state.auto_session_id,
+                        {
+                            "schema_version": 1,
+                            "auto_session_id": state.auto_session_id,
+                            "seed_id": current_seed.metadata.seed_id,
+                            "attempts": attempt,
+                            "verdict": state.last_qa_verdict,
+                            "score": float(qa_result.score),
+                            "recovery_fingerprint": recovery_fingerprint,
+                            "differences": state.last_qa_differences[:5],
+                            "suggestions": state.last_qa_suggestions[:5],
+                            "reason": "seed_qa_feedback_unmapped",
+                        },
+                    )
+                    state.mark_blocked(
+                        str(exc),
+                        tool_name="seed_qa",
+                        error_code="seed_qa_feedback_unmapped",
+                    )
+                    self._save(state)
+                    return (
+                        self._result(
+                            state, ledger, review=current_review, blocker=state.last_error
+                        ),
+                        current_seed,
+                        current_review,
+                    )
                 current_review = SeedReviewer(self.grade_gate).review(
                     current_seed,
                     ledger=ledger,
@@ -2906,12 +2955,10 @@ class AutoPipeline:
 
             details = [
                 f"Seed QA did not pass after {attempt} attempt(s): "
-                f"{qa_result.verdict} (score {qa_result.score:.2f})"
+                f"{state.last_qa_verdict} (score {qa_result.score:.2f})"
             ]
-            if qa_result.differences:
-                details.append("differences: " + "; ".join(qa_result.differences[:3]))
-            if qa_result.suggestions:
-                details.append("suggestions: " + "; ".join(qa_result.suggestions[:3]))
+            details.extend(state.last_qa_differences)
+            details.extend(state.last_qa_suggestions)
             await self._emit_runtime_event(
                 "auto.seed_qa.blocked",
                 state.auto_session_id,
@@ -2920,10 +2967,11 @@ class AutoPipeline:
                     "auto_session_id": state.auto_session_id,
                     "seed_id": current_seed.metadata.seed_id,
                     "attempts": attempt,
-                    "verdict": str(qa_result.verdict)[:80],
+                    "verdict": state.last_qa_verdict,
                     "score": float(qa_result.score),
-                    "differences": [str(item)[:320] for item in qa_result.differences[:5]],
-                    "suggestions": [str(item)[:320] for item in qa_result.suggestions[:5]],
+                    "recovery_fingerprint": recovery_fingerprint,
+                    "differences": state.last_qa_differences[:5],
+                    "suggestions": state.last_qa_suggestions[:5],
                     "reason": "repair_budget_exhausted",
                 },
             )
@@ -2960,10 +3008,11 @@ class AutoPipeline:
         if self.lateral_thinker is None:
             return _seed_with_seed_qa_feedback(seed, qa_result, attempt=attempt)
 
+        safe_feedback = _normalized_seed_qa_feedback(qa_result)
         already_tried = tuple(ThinkingPersona(value) for value in state.personas_invoked)
         persona = select_persona_for_qa_failure(
-            qa_result.differences,
-            qa_result.suggestions,
+            safe_feedback,
+            (),
             already_tried_personas=already_tried,
         )
         if persona is None:
@@ -2976,8 +3025,8 @@ class AutoPipeline:
             lateral_result = await asyncio.wait_for(
                 self.lateral_thinker(
                     persona=persona,
-                    qa_differences=qa_result.differences,
-                    qa_suggestions=qa_result.suggestions,
+                    qa_differences=safe_feedback,
+                    qa_suggestions=(),
                     run_artifact=seed_yaml,
                 ),
                 timeout=self._deadline_capped_timeout(
@@ -5104,6 +5153,8 @@ def _normalized_seed_qa_feedback(qa_result: EvaluateResult) -> tuple[str, ...]:
         if item.strip()
     )
     lowered = "\n".join(feedback).casefold()
+    if re.search(r"\bexit[_\s-]*conditions?\b", lowered):
+        raise SeedQaRepairMappingError(feedback)
     repairs: list[str] = []
     if "ambiguity_score" in lowered:
         repairs.append("Seed metadata must satisfy the readiness gate: ambiguity_score <= 0.20.")
@@ -5122,6 +5173,8 @@ def _normalized_seed_qa_feedback(qa_result: EvaluateResult) -> tuple[str, ...]:
         repairs.append("Define explicit no-op scope for supported command behavior.")
     if "review-blocking" in lowered:
         repairs.append("Introduce the review-blocking post-QA constraint before execution.")
+    if "binding" in lowered and "contract" in lowered:
+        repairs.append("Define one explicit binding contract before execution.")
     if "templated" in lowered or "indirect" in lowered:
         repairs.append(
             "Acceptance criteria must be direct executable checks, not generic templates."
@@ -5144,6 +5197,40 @@ def _actionable_seed_qa_feedback_constraints(feedback: tuple[str, ...]) -> tuple
         if cleaned and not _is_seed_qa_diagnostic_constraint(cleaned):
             repairs.append(f"Address this Seed QA finding before execution: {cleaned}")
     return tuple(dict.fromkeys(repairs))
+
+
+def _seed_qa_recovery_fingerprint(qa_result: EvaluateResult) -> str:
+    """Hash the bounded QA shape without persisting reviewer or prompt text."""
+    payload = json.dumps(
+        {
+            "differences": [item.strip() for item in qa_result.differences[:5] if item.strip()],
+            "schema_version": 1,
+            "suggestions": [item.strip() for item in qa_result.suggestions[:5] if item.strip()],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"sha256:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+def _safe_seed_qa_evidence(
+    feedback: tuple[str, ...], *, recovery_fingerprint: str
+) -> list[str]:
+    count = len(feedback[:5])
+    if count == 0:
+        return []
+    return [
+        f"{count} Seed QA feedback item(s) withheld from durable state; "
+        f"recovery_fingerprint={recovery_fingerprint}"
+    ]
+
+
+def _safe_seed_qa_verdict(verdict: str) -> str:
+    normalized = verdict.strip().casefold()
+    if normalized in {"fail", "pass", "revise"}:
+        return normalized
+    return "unknown"
 
 
 def _first_nonempty(*values: str | None) -> str | None:

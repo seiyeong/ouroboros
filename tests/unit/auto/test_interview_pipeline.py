@@ -1824,6 +1824,15 @@ async def test_pipeline_blocks_run_when_seed_qa_does_not_pass(tmp_path) -> None:
     assert "Seed QA did not pass" in result.blocker
     assert state.last_tool_name == "seed_qa"
     assert state.last_qa_score == 0.58
+    assert state.last_qa_differences == [
+        "1 Seed QA feedback item(s) withheld from durable state; "
+        "recovery_fingerprint=sha256:c7bde65010b2f8ec9ec218f44f1f7c67c8f5fa3dff7061d28dd79a0b83f960ea"
+    ]
+    assert state.last_qa_suggestions == [
+        "1 Seed QA feedback item(s) withheld from durable state; "
+        "recovery_fingerprint=sha256:c7bde65010b2f8ec9ec218f44f1f7c67c8f5fa3dff7061d28dd79a0b83f960ea"
+    ]
+    assert "missing interview nuance" not in str(state.to_dict())
 
 
 @pytest.mark.asyncio
@@ -2041,7 +2050,10 @@ async def test_pipeline_seed_qa_lateral_repair_folds_concrete_decision(tmp_path)
     # lateral was invoked exactly once for the failed attempt, with the QA shape
     # and the current Seed YAML as the run artifact.
     assert len(lateral_calls) == 1
-    assert lateral_calls[0]["differences"] == ("no binding CSV contract chosen",)
+    assert lateral_calls[0]["differences"] == (
+        "Define one explicit binding contract before execution.",
+    )
+    assert lateral_calls[0]["suggestions"] == ()
     assert lateral_calls[0]["artifact"].strip()
     # the persona was recorded for chain progression / resume
     assert state.personas_invoked
