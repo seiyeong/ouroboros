@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from ouroboros.core.types import Result
+from ouroboros.events.base import BaseEvent
 from ouroboros.mcp.errors import MCPToolError
 from ouroboros.mcp.job_manager import JobManager, JobSnapshot, JobStatus
 from ouroboros.mcp.tools import evaluation_handlers, execution_handlers
@@ -187,7 +188,7 @@ class _SuccessfulExecuteHandler:
         )
 
 
-async def test_successful_run_enqueues_chained_evaluate_job(
+async def test_successful_run_waits_for_chained_evaluate_approval(
     event_store,
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -249,10 +250,14 @@ async def test_successful_run_enqueues_chained_evaluate_job(
     evaluation_job_id = snapshot.result_meta["chained_evaluate_job_id"]
     assert isinstance(evaluation_job_id, str)
     assert evaluation_job_id.startswith("job_")
-    assert snapshot.result_meta["verification_status"] == "evaluation_enqueued"
-    assert snapshot.result_meta["evaluation_status"] == "enqueued"
-    assert snapshot.result_meta["evaluated"] is False
-    assert "Manual Retry: ooo evaluate" in (snapshot.result_text or "")
+    assert snapshot.result_meta["verification_status"] == "verified"
+    assert snapshot.result_meta["evaluation_status"] == "approved"
+    assert snapshot.result_meta["evaluated"] is True
+    assert snapshot.result_meta["formal_evaluation_required"] is False
+    assert snapshot.result_meta["final_approved"] is True
+    assert "next_step" not in snapshot.result_meta
+    assert "Formal Evaluation: APPROVED" in (snapshot.result_text or "")
+    assert "Formal Evaluation: NOT evaluated" not in (snapshot.result_text or "")
     await _wait_for_call(evaluate_calls)
     evaluate_snapshot = await job_manager.get_snapshot(evaluation_job_id)
     assert evaluate_snapshot.job_type == "evaluate"
@@ -265,6 +270,223 @@ async def test_successful_run_enqueues_chained_evaluate_job(
     ]
     assert evaluate_calls[0]["arguments"]["working_dir"] == str(tmp_path)
     assert "execution artifact" in evaluate_calls[0]["arguments"]["artifact"]
+
+
+async def test_chained_evaluate_uses_durable_execution_receipt(
+    event_store,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
+    evaluate_calls: list[dict[str, Any]] = []
+
+    class ReceiptExecuteHandler:
+        agent_runtime_backend = None
+        llm_backend = None
+
+        async def handle(
+            self,
+            arguments: dict[str, Any],
+            *,
+            execution_id: str | None = None,
+            session_id_override: str | None = None,
+            synchronous: bool = False,
+        ) -> Result[MCPToolResult, Any]:
+            assert execution_id is not None
+            assert session_id_override is not None
+            assert synchronous is True
+            await event_store.append(
+                BaseEvent(
+                    type="execution.terminal",
+                    aggregate_type="execution",
+                    aggregate_id=execution_id,
+                    data={
+                        "session_id": session_id_override,
+                        "status": "completed",
+                        "summary": {
+                            "verification_report": (
+                                "Success: 1/1\n"
+                                "File Changes:\n- lazycodex_canary.txt\n"
+                                "tests_passed: verify_command exit 0"
+                            )
+                        },
+                    },
+                )
+            )
+            return Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="run-only warning"),),
+                    is_error=False,
+                    meta={
+                        "session_id": session_id_override,
+                        "execution_id": execution_id,
+                        "success": True,
+                    },
+                )
+            )
+
+    class FakeEvaluateHandler:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def handle(self, arguments: dict[str, Any]) -> Result[MCPToolResult, Any]:
+            evaluate_calls.append(arguments)
+            return Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="approved"),),
+                    is_error=False,
+                    meta={"final_approved": True, "session_id": arguments["session_id"]},
+                )
+            )
+
+    monkeypatch.setattr(evaluation_handlers, "EvaluateHandler", FakeEvaluateHandler)
+
+    job_manager = JobManager(event_store)
+    handler = StartExecuteSeedHandler(
+        execute_handler=ReceiptExecuteHandler(),  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=job_manager,
+    )
+
+    started = await handler.handle({"seed_content": "goal: receipt\n", "cwd": str(tmp_path)})
+    assert started.is_ok
+    snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
+
+    assert snapshot.status is JobStatus.COMPLETED
+    await _wait_for_call(evaluate_calls)
+    artifact = evaluate_calls[0]["artifact"]
+    assert artifact.startswith("Run acceptance receipt:")
+    assert "verify_command exit 0" in artifact
+    assert "run-only warning" not in artifact
+
+
+async def test_chained_evaluate_rejection_fails_run(
+    event_store,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
+
+    class RejectingEvaluateHandler:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def handle(self, arguments: dict[str, Any]) -> Result[MCPToolResult, Any]:
+            return Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="rejected AC"),),
+                    is_error=False,
+                    meta={"final_approved": False, "session_id": arguments["session_id"]},
+                )
+            )
+
+    monkeypatch.setattr(evaluation_handlers, "EvaluateHandler", RejectingEvaluateHandler)
+
+    job_manager = JobManager(event_store)
+    handler = StartExecuteSeedHandler(
+        execute_handler=_SuccessfulExecuteHandler(),  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=job_manager,
+    )
+
+    started = await handler.handle({"seed_content": "goal: rejection\n", "cwd": str(tmp_path)})
+    assert started.is_ok
+
+    snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
+
+    assert snapshot.status is JobStatus.FAILED
+    assert snapshot.result_meta["success"] is False
+    assert snapshot.result_meta["evaluated"] is True
+    assert snapshot.result_meta["verification_status"] == "evaluation_rejected"
+    assert snapshot.result_meta["evaluation_status"] == "rejected"
+    assert snapshot.result_meta["final_approved"] is False
+    assert "Formal Evaluation: rejected; run is not complete." in (snapshot.result_text or "")
+
+
+async def test_chained_evaluate_timeout_fails_run_with_specific_meta(
+    event_store,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
+
+    class TimedOutEvaluateHandler:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def handle(self, arguments: dict[str, Any]) -> Result[MCPToolResult, Any]:
+            return Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="evaluation timed out"),),
+                    is_error=True,
+                    meta={
+                        "session_id": arguments["session_id"],
+                        "evaluation_status": "timed_out",
+                    },
+                )
+            )
+
+    monkeypatch.setattr(evaluation_handlers, "EvaluateHandler", TimedOutEvaluateHandler)
+
+    job_manager = JobManager(event_store)
+    handler = StartExecuteSeedHandler(
+        execute_handler=_SuccessfulExecuteHandler(),  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=job_manager,
+    )
+
+    started = await handler.handle({"seed_content": "goal: timeout\n", "cwd": str(tmp_path)})
+    assert started.is_ok
+
+    snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
+
+    assert snapshot.status is JobStatus.FAILED
+    assert snapshot.result_meta["evaluated"] is False
+    assert snapshot.result_meta["verification_status"] == "evaluation_unavailable"
+    assert snapshot.result_meta["evaluation_status"] == "timed_out"
+    assert snapshot.result_meta["final_approved"] is False
+    assert snapshot.result_meta["chained_evaluate_job_id"].startswith("job_")
+
+
+async def test_chained_evaluate_completed_without_verdict_fails_run(
+    event_store,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
+
+    class InvalidEvaluateHandler:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def handle(self, arguments: dict[str, Any]) -> Result[MCPToolResult, Any]:
+            return Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="missing verdict"),),
+                    is_error=False,
+                    meta={"session_id": arguments["session_id"]},
+                )
+            )
+
+    monkeypatch.setattr(evaluation_handlers, "EvaluateHandler", InvalidEvaluateHandler)
+
+    job_manager = JobManager(event_store)
+    handler = StartExecuteSeedHandler(
+        execute_handler=_SuccessfulExecuteHandler(),  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=job_manager,
+    )
+
+    started = await handler.handle({"seed_content": "goal: invalid\n", "cwd": str(tmp_path)})
+    assert started.is_ok
+
+    snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
+
+    assert snapshot.status is JobStatus.FAILED
+    assert snapshot.result_meta["evaluated"] is False
+    assert snapshot.result_meta["evaluation_status"] == "invalid_result"
+    assert snapshot.result_meta["final_approved"] is False
+    assert snapshot.result_meta["chained_evaluate_job_id"].startswith("job_")
 
 
 async def test_run_job_stranded_without_terminal_event_still_terminalizes(
@@ -493,7 +715,7 @@ async def test_auto_evaluate_config_false_preserves_legacy_run_meta_exactly(
     assert snapshot.result_meta["verification_status"] == "executed_unverified"
 
 
-async def test_evaluate_enqueue_failure_keeps_run_completed(
+async def test_evaluate_enqueue_failure_fails_run(
     event_store,
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -521,13 +743,13 @@ async def test_evaluate_enqueue_failure_keeps_run_completed(
 
     snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
 
-    assert snapshot.status == JobStatus.COMPLETED
-    assert snapshot.result_meta["success"] is True
+    assert snapshot.status == JobStatus.FAILED
+    assert snapshot.result_meta["success"] is False
     assert snapshot.result_meta["evaluation_status"] == "enqueue_failed"
     assert snapshot.result_meta["evaluation_error"] == "enqueue boom"
     assert snapshot.result_meta["next_step"].startswith("ooo evaluate orch_")
     assert "chained_evaluate_job_id" not in snapshot.result_meta
-    assert "run result remains successful" in (snapshot.result_text or "")
+    assert "Formal Evaluation: enqueue_failed; run is not complete." in (snapshot.result_text or "")
 
 
 async def test_start_evaluate_timeout_writes_terminal_event(

@@ -445,18 +445,19 @@ fallback instead of retrying the failing call.
 10. **Post-execution QA and formal evaluation** (automatic):
    `ouroboros_start_execute_seed` automatically runs QA after successful execution.
    The QA verdict is included in the final job result text. This QA check is
-   **not** the formal 3-stage evaluator. On servers that return
-   `chained_evaluate_job_id`, the successful run has already enqueued the formal
-   evaluator as a separate bounded background job.
+   **not** the formal 3-stage evaluator. With `auto_evaluate: true` (the default),
+   the parent Run job stays non-terminal while its bounded chained evaluator runs.
+   It becomes `completed` only after that evaluator returns `final_approved: true`.
+   A rejection, timeout, enqueue failure, or missing final verdict terminates the
+   parent Run job as `failed`; it must never be reported as a completed run.
    To skip: pass `skip_qa: true` to the tool.
 
    If the final run result meta contains `chained_evaluate_job_id`:
-   - The current polling owner continues with that job ID
-   - Fetch its verdict with `ouroboros_job_result` after terminal status
-   - Render **APPROVED** when `final_approved: true`; otherwise render not approved and list failed ACs or the failure reason from the evaluation result
-   - If the evaluate job failed or timed out, keep the run success intact and show `Next: ooo evaluate <session_id>` as the manual retry
+   - Treat it as the attached formal-evaluation receipt for the same parent job
+   - Render **APPROVED** only when parent `verification_status: verified` and `final_approved: true`
+   - For a failed parent, render the attached evaluator failure/rejection and show `Next: ooo evaluate <session_id>` as the manual retry
 
-   If `chained_evaluate_job_id` is absent, keep the legacy path verbatim:
+   If `auto_evaluate: false` and `chained_evaluate_job_id` is absent, keep the legacy path verbatim:
    - **PASS**: `Next: ooo evaluate <session_id> for formal 3-stage verification`
    - **REVISE**: Show differences/suggestions, then `Next: Fix the issues above, then ooo run to retry -- or ooo unstuck if blocked`
    - **FAIL/ESCALATE**: `Next: Review failures above, then ooo run to retry -- or ooo unstuck if blocked`
@@ -504,16 +505,13 @@ Result:
   Goal: Build a CLI task manager
   Duration: 45.2s
   Messages Processed: 12
-  Verification Status: executed_unverified
-  Formal Evaluation: NOT evaluated by the 3-stage evaluator
-
-  Next: `ooo evaluate orch_x1y2z3` for formal 3-stage verification
-
-  # Newer server path:
-  Verification Status: evaluation_enqueued
+  Verification Status: verified
   Chained Evaluation Job ID: job_eval987
-  [Poll ouroboros_job_wait/job_status, then fetch ouroboros_job_result]
   Formal Evaluation Verdict: APPROVED
+
+  # Legacy opt-out only (`auto_evaluate: false`):
+  Verification Status: executed_unverified
+  Next: `ooo evaluate orch_x1y2z3` for formal 3-stage verification
 ```
 
 ## RFC #1392 State Breadcrumb Footer

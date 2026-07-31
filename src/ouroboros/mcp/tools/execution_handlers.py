@@ -44,7 +44,7 @@ from ouroboros.core.worktree import (
 )
 from ouroboros.evaluation.verification_artifacts import build_verification_artifacts
 from ouroboros.mcp.errors import MCPServerError, MCPToolError
-from ouroboros.mcp.job_manager import JobLinks, JobManager
+from ouroboros.mcp.job_manager import JobLinks, JobManager, JobStatus
 from ouroboros.mcp.tools._dashboard import resolve_dashboard_run_url
 from ouroboros.mcp.tools.background import start_background_tool_job
 from ouroboros.mcp.tools.bridge_mixin import BridgeAwareMixin
@@ -609,80 +609,146 @@ def _result_evaluation_working_dir(result: MCPToolResult, fallback: Path) -> Pat
     return fallback
 
 
+async def _chained_evaluation_artifact(
+    event_store: EventStore,
+    run_result: MCPToolResult,
+    session_id: str | None,
+) -> str:
+    fallback = run_result.text_content or "Execution completed successfully."
+    execution_id = run_result.meta.get("execution_id")
+    if not isinstance(execution_id, str) or not execution_id:
+        return fallback
+    try:
+        terminal_events = await event_store.query_events(
+            aggregate_id=execution_id,
+            event_type="execution.terminal",
+            limit=None,
+        )
+    except Exception:  # noqa: BLE001 - formal evaluation still owns the final gate.
+        log.warning(
+            "mcp.tool.start_execute_seed.chained_evaluate.receipt_query_failed",
+            execution_id=execution_id,
+            exc_info=True,
+        )
+        return fallback
+    for event in terminal_events:
+        data = event.data
+        if data.get("session_id") != session_id or data.get("status") != "completed":
+            continue
+        summary = data.get("summary")
+        if not isinstance(summary, dict):
+            continue
+        verification_report = summary.get("verification_report")
+        if isinstance(verification_report, str) and verification_report.strip():
+            return "Run acceptance receipt:\n\n" + verification_report.strip()
+    log.warning(
+        "mcp.tool.start_execute_seed.chained_evaluate.receipt_missing",
+        execution_id=execution_id,
+        session_id=session_id,
+    )
+    return fallback
+
+
 def _append_result_text(
     result: MCPToolResult,
     text: str,
     *,
     meta: dict[str, Any],
+    is_error: bool | None = None,
 ) -> MCPToolResult:
     return MCPToolResult(
         content=(
             *result.content,
             MCPContentItem(type=ContentType.TEXT, text=text),
         ),
+        is_error=result.is_error if is_error is None else is_error,
+        meta=meta,
+        structured_content=result.structured_content,
+    )
+
+
+def _replace_result_text(
+    result: MCPToolResult,
+    text: str,
+    *,
+    meta: dict[str, Any],
+) -> MCPToolResult:
+    return MCPToolResult(
+        content=(MCPContentItem(type=ContentType.TEXT, text=text),),
         is_error=result.is_error,
         meta=meta,
         structured_content=result.structured_content,
     )
 
 
-def _evaluation_enqueued_meta(
+def _evaluation_approved_meta(
     run_result: MCPToolResult,
     *,
-    session_id: str | None,
     evaluation_job_id: str,
 ) -> dict[str, Any]:
-    retry_step = f"ooo evaluate {session_id}" if session_id else "ooo evaluate <session_id>"
-    return {
-        **run_result.meta,
-        **_run_only_verification_meta(
-            session_id,
-            verification_status="evaluation_enqueued",
-        ),
-        "chained_evaluate_job_id": evaluation_job_id,
-        "evaluation_status": "enqueued",
-        "next_step": (
-            f"ouroboros_job_wait {evaluation_job_id}, then ouroboros_job_result {evaluation_job_id}"
-        ),
-        "manual_retry_next_step": retry_step,
-    }
-
-
-def _evaluation_enqueued_text(session_id: str | None, evaluation_job_id: str) -> str:
-    retry_step = f"ooo evaluate {session_id}" if session_id else "ooo evaluate <session_id>"
-    return (
-        "\nFormal Evaluation: queued as a bounded background job\n"
-        f"Chained Evaluation Job ID: {evaluation_job_id}\n"
-        f"Next: poll ouroboros_job_wait(job_id={evaluation_job_id}) and "
-        f"then ouroboros_job_result(job_id={evaluation_job_id}).\n"
-        f"Manual Retry: {retry_step}\n"
-    )
-
-
-def _evaluation_enqueue_failed_meta(
-    run_result: MCPToolResult,
-    *,
-    session_id: str | None,
-    error: str,
-) -> dict[str, Any]:
-    retry_step = f"ooo evaluate {session_id}" if session_id else "ooo evaluate <session_id>"
     meta = dict(run_result.meta)
-    if "verification_status" not in meta:
-        meta.update(_run_only_verification_meta(session_id))
+    meta.pop("next_step", None)
+    meta.pop("manual_retry_next_step", None)
     meta.update(
         {
-            "evaluation_status": "enqueue_failed",
-            "evaluation_error": error[:1000],
-            "next_step": retry_step,
+            "success": True,
+            "evaluated": True,
+            "verification_status": "verified",
+            "formal_evaluation_required": False,
+            "chained_evaluate_job_id": evaluation_job_id,
+            "evaluation_status": "approved",
+            "final_approved": True,
         }
     )
     return meta
 
 
-def _evaluation_enqueue_failed_text(session_id: str | None, error: str) -> str:
+def _evaluation_approved_text(evaluation_job_id: str, evaluation_text: str | None) -> str:
+    rendered_evaluation = evaluation_text.strip() if evaluation_text else ""
+    return f"\nFormal Evaluation: APPROVED\nChained Evaluation Job ID: {evaluation_job_id}\n" + (
+        f"{rendered_evaluation}\n" if rendered_evaluation else ""
+    )
+
+
+def _evaluation_failure_meta(
+    run_result: MCPToolResult,
+    *,
+    session_id: str | None,
+    evaluation_status: str,
+    evaluation_job_id: str | None,
+    evaluated: bool,
+    error: str,
+) -> dict[str, Any]:
     retry_step = f"ooo evaluate {session_id}" if session_id else "ooo evaluate <session_id>"
+    meta = {
+        **run_result.meta,
+        "success": False,
+        "status": "failed",
+        "evaluated": evaluated,
+        "verification_status": "evaluation_rejected" if evaluated else "evaluation_unavailable",
+        "formal_evaluation_required": not evaluated,
+        "evaluation_status": evaluation_status,
+        "final_approved": False,
+        "evaluation_error": error[:1000],
+        "next_step": retry_step,
+    }
+    if evaluation_job_id is not None:
+        meta["chained_evaluate_job_id"] = evaluation_job_id
+    return meta
+
+
+def _evaluation_failure_text(
+    session_id: str | None,
+    *,
+    evaluation_status: str,
+    error: str,
+    evaluation_job_id: str | None,
+) -> str:
+    retry_step = f"ooo evaluate {session_id}" if session_id else "ooo evaluate <session_id>"
+    job_line = f"Chained Evaluation Job ID: {evaluation_job_id}\n" if evaluation_job_id else ""
     return (
-        "\nFormal Evaluation: enqueue failed; run result remains successful.\n"
+        f"\nFormal Evaluation: {evaluation_status}; run is not complete.\n"
+        f"{job_line}"
         f"Evaluation Error: {error[:1000]}\n"
         f"Next: {retry_step}\n"
     )
@@ -2408,7 +2474,11 @@ class StartExecuteSeedHandler:
     ) -> MCPToolResult:
         from ouroboros.mcp.tools.evaluation_handlers import StartEvaluateHandler
 
-        artifact = run_result.text_content or "Execution completed successfully."
+        artifact = await _chained_evaluation_artifact(
+            self._event_store,
+            run_result,
+            session_id,
+        )
         evaluation_arguments: dict[str, Any] = {
             "session_id": session_id,
             "artifact": artifact,
@@ -2453,28 +2523,46 @@ class StartExecuteSeedHandler:
                 opencode_mode=self.opencode_mode,
             )
             evaluate_result = await start_evaluate.handle(evaluation_arguments)
-        except Exception as exc:  # noqa: BLE001 - evaluation must never flip run success.
+        except Exception as exc:  # noqa: BLE001 - surface an unverified run as failed.
             error = str(exc)
             return _append_result_text(
                 run_result,
-                _evaluation_enqueue_failed_text(session_id, error),
-                meta=_evaluation_enqueue_failed_meta(
+                _evaluation_failure_text(
+                    session_id,
+                    evaluation_status="enqueue_failed",
+                    error=error,
+                    evaluation_job_id=None,
+                ),
+                meta=_evaluation_failure_meta(
                     run_result,
                     session_id=session_id,
+                    evaluation_status="enqueue_failed",
+                    evaluation_job_id=None,
+                    evaluated=False,
                     error=error,
                 ),
+                is_error=True,
             )
 
         if evaluate_result.is_err:
             error = evaluate_result.error.message
             return _append_result_text(
                 run_result,
-                _evaluation_enqueue_failed_text(session_id, error),
-                meta=_evaluation_enqueue_failed_meta(
+                _evaluation_failure_text(
+                    session_id,
+                    evaluation_status="enqueue_failed",
+                    error=error,
+                    evaluation_job_id=None,
+                ),
+                meta=_evaluation_failure_meta(
                     run_result,
                     session_id=session_id,
+                    evaluation_status="enqueue_failed",
+                    evaluation_job_id=None,
+                    evaluated=False,
                     error=error,
                 ),
+                is_error=True,
             )
 
         evaluation_job_id = evaluate_result.value.meta.get("job_id")
@@ -2482,22 +2570,97 @@ class StartExecuteSeedHandler:
             error = "StartEvaluateHandler did not return a pollable evaluation job_id"
             return _append_result_text(
                 run_result,
-                _evaluation_enqueue_failed_text(session_id, error),
-                meta=_evaluation_enqueue_failed_meta(
+                _evaluation_failure_text(
+                    session_id,
+                    evaluation_status="enqueue_failed",
+                    error=error,
+                    evaluation_job_id=None,
+                ),
+                meta=_evaluation_failure_meta(
                     run_result,
                     session_id=session_id,
+                    evaluation_status="enqueue_failed",
+                    evaluation_job_id=None,
+                    evaluated=False,
                     error=error,
+                ),
+                is_error=True,
+            )
+
+        try:
+            evaluation_snapshot = await self._job_manager.get_snapshot(evaluation_job_id)
+            while not evaluation_snapshot.is_terminal:
+                evaluation_snapshot, _ = await self._job_manager.wait_for_change(
+                    evaluation_job_id,
+                    cursor=evaluation_snapshot.cursor,
+                    timeout_seconds=10,
+                )
+        except asyncio.CancelledError:
+            try:
+                await self._job_manager.cancel_job(evaluation_job_id)
+            except Exception:  # noqa: BLE001 - do not mask caller cancellation.
+                log.warning(
+                    "mcp.tool.start_execute_seed.chained_evaluate.cancel_failed",
+                    evaluation_job_id=evaluation_job_id,
+                    exc_info=True,
+                )
+            raise
+
+        evaluation_meta = evaluation_snapshot.result_meta
+        final_approved = (
+            evaluation_snapshot.status is JobStatus.COMPLETED
+            and evaluation_meta.get("final_approved") is True
+        )
+        evaluated = evaluation_snapshot.status is JobStatus.COMPLETED and isinstance(
+            evaluation_meta.get("final_approved"), bool
+        )
+        if final_approved:
+            return _replace_result_text(
+                run_result,
+                _evaluation_approved_text(evaluation_job_id, evaluation_snapshot.result_text),
+                meta=_evaluation_approved_meta(
+                    run_result,
+                    evaluation_job_id=evaluation_job_id,
                 ),
             )
 
+        child_evaluation_status = evaluation_meta.get("evaluation_status")
+        evaluation_status = (
+            "rejected"
+            if evaluated
+            else (
+                "invalid_result"
+                if evaluation_snapshot.status is JobStatus.COMPLETED
+                else (
+                    child_evaluation_status
+                    if isinstance(child_evaluation_status, str) and child_evaluation_status
+                    else evaluation_snapshot.status.value
+                )
+            )
+        )
+        error = (
+            evaluation_snapshot.result_text
+            or evaluation_snapshot.error
+            or evaluation_snapshot.message
+            or "Formal evaluation did not produce an approved verdict"
+        )
         return _append_result_text(
             run_result,
-            _evaluation_enqueued_text(session_id, evaluation_job_id),
-            meta=_evaluation_enqueued_meta(
-                run_result,
-                session_id=session_id,
+            _evaluation_failure_text(
+                session_id,
+                evaluation_status=evaluation_status,
+                error=error,
                 evaluation_job_id=evaluation_job_id,
             ),
+            meta=_evaluation_failure_meta(
+                run_result,
+                session_id=session_id,
+                evaluation_status=evaluation_status,
+                evaluation_job_id=evaluation_job_id,
+                evaluated=evaluated,
+                error=error,
+            ),
+            is_error=True,
         )
 
     async def handle(
