@@ -8,10 +8,10 @@ This module contains handlers for seed execution:
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+import hashlib
 import inspect
 import os
 from pathlib import Path
-import re
 from typing import Any
 from uuid import uuid4
 
@@ -610,14 +610,7 @@ def _result_evaluation_working_dir(result: MCPToolResult, fallback: Path) -> Pat
     return fallback
 
 
-_CANONICAL_COMPLETED_TASK_HEADER_RE = re.compile(r"### Task (?P<index>[1-9]\d*): \[COMPLETED\] .+")
-_CANONICAL_NON_COMPLETED_RESULT_HEADER_RE = re.compile(
-    r"^#{3,6} (?:Task|Subtask) [1-9]\d*(?:\.[1-9]\d*)*: \[(?!COMPLETED\])",
-    flags=re.MULTILINE,
-)
-
-
-def _canonical_execution_receipt(summary: Mapping[str, Any]) -> str | None:
+def _canonical_execution_receipt(summary: Mapping[str, object]) -> str | None:
     count_keys = (
         "acceptance_criteria_count",
         "success_count",
@@ -649,37 +642,66 @@ def _canonical_execution_receipt(summary: Mapping[str, Any]) -> str | None:
         return None
 
     verification_report = summary.get("verification_report")
-    if not isinstance(verification_report, str):
-        return None
-    canonical_report = verification_report.strip()
-    report_lines = canonical_report.splitlines()
-    expected_success_line = f"Success: {total}/{total}"
+    verification_report_sha256 = summary.get("verification_report_sha256")
     if (
-        len(report_lines) < 4
+        not isinstance(verification_report, str)
+        or verification_report != verification_report.strip()
+        or not isinstance(verification_report_sha256, str)
+        or hashlib.sha256(verification_report.encode("utf-8")).hexdigest()
+        != verification_report_sha256
+    ):
+        return None
+    report_lines = verification_report.splitlines()
+    expected_success_line = f"Success: {total}/{total}"
+    try:
+        task_results_start = report_lines.index("## Task Results")
+    except ValueError:
+        return None
+    if (
+        task_results_start < 2
         or report_lines[:2] != ["Parallel Execution Verification Report", expected_success_line]
-        or [line for line in report_lines if line.startswith("Success: ")]
+        or [line for line in report_lines[:task_results_start] if line.startswith("Success: ")]
         != [expected_success_line]
-        or report_lines.count("## Task Results") != 1
     ):
         return None
 
-    task_results_start = report_lines.index("## Task Results")
-    task_lines = report_lines[task_results_start + 1 :]
-    if _CANONICAL_NON_COMPLETED_RESULT_HEADER_RE.search("\n".join(task_lines)) is not None:
+    task_results = summary.get("task_results")
+    if not isinstance(task_results, list) or len(task_results) != total:
         return None
-    task_headers = [line for line in task_lines if line.startswith("### Task ")]
-    if len(task_headers) != total:
-        return None
+    outcome_counts = {"succeeded": 0, "satisfied_externally": 0}
     task_indexes: set[int] = set()
-    for header in task_headers:
-        match = _CANONICAL_COMPLETED_TASK_HEADER_RE.fullmatch(header)
-        if match is None:
+    durable_task_lines = [
+        "## Durable Task Receipt",
+        f"verification_report_sha256: {verification_report_sha256}",
+    ]
+    for task_result in task_results:
+        if not isinstance(task_result, Mapping):
             return None
-        task_indexes.add(int(match.group("index")))
-    if task_indexes != set(range(1, total + 1)):
+        ac_index = task_result.get("ac_index")
+        outcome = task_result.get("outcome")
+        if (
+            type(ac_index) is not int
+            or ac_index < 0
+            or not isinstance(outcome, str)
+            or outcome not in outcome_counts
+            or task_result.get("success") is not True
+            or task_result.get("evidence_present") is not True
+        ):
+            return None
+        task_indexes.add(ac_index)
+        outcome_counts[outcome] += 1
+        durable_task_lines.append(
+            f"- Task {ac_index + 1}: [COMPLETED] outcome={outcome}; evidence=recorded"
+        )
+    if task_indexes != set(range(total)):
+        return None
+    if (
+        outcome_counts["succeeded"] != counts["success_count"]
+        or outcome_counts["satisfied_externally"] != counts["externally_satisfied_count"]
+    ):
         return None
 
-    return canonical_report
+    return verification_report + "\n\n" + "\n".join(durable_task_lines)
 
 
 async def _chained_evaluation_artifact(

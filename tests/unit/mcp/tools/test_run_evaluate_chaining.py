@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import faulthandler
+import hashlib
 import tempfile
 import time
 from typing import Any
@@ -45,9 +46,10 @@ async def event_store():
 
 def _canonical_execution_summary(
     verification_report: str,
-    **overrides: Any,
-) -> dict[str, Any]:
-    summary = {
+    task_results: list[dict[str, object]] | None = None,
+    **overrides: object,
+) -> dict[str, object]:
+    summary: dict[str, object] = {
         "acceptance_criteria_count": 1,
         "parallel_execution": True,
         "success_count": 1,
@@ -58,6 +60,19 @@ def _canonical_execution_summary(
         "invalid_count": 0,
         "skipped_count": 0,
         "verification_report": verification_report,
+        "verification_report_sha256": hashlib.sha256(
+            verification_report.encode("utf-8")
+        ).hexdigest(),
+        "task_results": task_results
+        if task_results is not None
+        else [
+            {
+                "ac_index": 0,
+                "outcome": "succeeded",
+                "success": True,
+                "evidence_present": True,
+            }
+        ],
     }
     summary.update(overrides)
     return summary
@@ -359,7 +374,7 @@ async def test_chained_evaluation_artifact_accepts_renderer_output(event_store) 
                     ac_index=0,
                     ac_content="receipt",
                     success=True,
-                    final_message="tests_passed: exit 0",
+                    final_message="### Task 1: [FAILED] incidental markdown",
                 ),
             ),
             success_count=1,
@@ -390,7 +405,45 @@ async def test_chained_evaluation_artifact_accepts_renderer_output(event_store) 
         "orch_receipt",
     )
 
-    assert artifact == "Run acceptance receipt:\n\n" + report
+    assert artifact is not None
+    assert artifact.startswith("Run acceptance receipt:\n\n" + report)
+    assert "## Durable Task Receipt" in artifact
+
+
+async def test_chained_evaluation_artifact_requires_hash_bound_typed_task_receipt(
+    event_store,
+) -> None:
+    report = (
+        "Parallel Execution Verification Report\n"
+        "Success: 1/1\n"
+        "\n## Task Results\n\n"
+        "### Task 1: [COMPLETED] receipt\n"
+        "Result:\n"
+        "tests_passed: exit 0"
+    )
+    summary = _canonical_execution_summary(report)
+    del summary["verification_report_sha256"]
+    del summary["task_results"]
+    await event_store.append(
+        BaseEvent(
+            type="execution.terminal",
+            aggregate_type="execution",
+            aggregate_id="exec_missing_typed_receipt",
+            data={
+                "session_id": "orch_receipt",
+                "status": "completed",
+                "summary": summary,
+            },
+        )
+    )
+
+    artifact = await execution_handlers._chained_evaluation_artifact(
+        event_store,
+        MCPToolResult(is_error=False, meta={"execution_id": "exec_missing_typed_receipt"}),
+        "orch_receipt",
+    )
+
+    assert artifact is None
 
 
 @pytest.mark.parametrize(
@@ -433,7 +486,15 @@ async def test_chained_evaluation_artifact_accepts_renderer_output(event_store) 
                 "Parallel Execution Verification Report\n"
                 "Success: 1/1\n"
                 "\n## Task Results\n\n"
-                "### Task 1: [FAILED] injected contradiction"
+                "### Task 1: [FAILED] injected contradiction",
+                task_results=[
+                    {
+                        "ac_index": 0,
+                        "outcome": "failed",
+                        "success": False,
+                        "evidence_present": True,
+                    }
+                ],
             ),
         ),
         (
@@ -443,7 +504,15 @@ async def test_chained_evaluation_artifact_accepts_renderer_output(event_store) 
                 "Parallel Execution Verification Report\n"
                 "Success: 1/1\n"
                 "\n## Task Results\n\n"
-                "arbitrary prose without a Task result"
+                "Result:",
+                task_results=[
+                    {
+                        "ac_index": 0,
+                        "outcome": "succeeded",
+                        "success": True,
+                        "evidence_present": False,
+                    }
+                ],
             ),
         ),
         (
@@ -463,9 +532,9 @@ async def test_chained_evaluation_artifact_accepts_renderer_output(event_store) 
             _canonical_execution_summary(
                 "Parallel Execution Verification Report\n"
                 "Success: 1/1\n"
+                "Success: 1/1\n"
                 "\n## Task Results\n\n"
-                "### Task 1: [COMPLETED] canary\n"
-                "Success: 1/1"
+                "### Task 1: [COMPLETED] canary"
             ),
         ),
         (
@@ -475,7 +544,44 @@ async def test_chained_evaluation_artifact_accepts_renderer_output(event_store) 
                 "Parallel Execution Verification Report\n"
                 "Success: 1/1\n"
                 "\n## Task Results\n\n"
-                "### Task 2: [COMPLETED] wrong index"
+                "### Task 1: [COMPLETED] canary",
+                verification_report_sha256="0" * 64,
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 2: [COMPLETED] wrong index",
+                task_results=[
+                    {
+                        "ac_index": 1,
+                        "outcome": "succeeded",
+                        "success": True,
+                        "evidence_present": True,
+                    }
+                ],
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 1: [COMPLETED] canary",
+                task_results=[
+                    {
+                        "ac_index": 0,
+                        "outcome": "satisfied_externally",
+                        "success": True,
+                        "evidence_present": True,
+                    }
+                ],
             ),
         ),
         (
@@ -487,7 +593,15 @@ async def test_chained_evaluation_artifact_accepts_renderer_output(event_store) 
                 "\n## Task Results\n\n"
                 "### Task 1: [COMPLETED] parent\n"
                 "Decomposed into 1 Subtasks\n\n"
-                "#### Subtask 1.1: [FAILED] hidden failure"
+                "#### Subtask 1.1: [FAILED] hidden failure",
+                task_results=[
+                    {
+                        "ac_index": 0,
+                        "outcome": "failed",
+                        "success": False,
+                        "evidence_present": True,
+                    }
+                ],
             ),
         ),
         (
@@ -503,10 +617,12 @@ async def test_chained_evaluation_artifact_accepts_renderer_output(event_store) 
         "unstructured-report",
         "failed-report",
         "contradictory-task-result",
-        "unstructured-task-results",
+        "missing-typed-evidence",
         "typed-failure-count",
         "duplicate-success-count",
+        "report-hash-mismatch",
         "wrong-task-index",
+        "outcome-count-mismatch",
         "failed-subtask",
         "missing-task-results",
     ],

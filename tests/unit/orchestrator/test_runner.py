@@ -8503,6 +8503,30 @@ class TestOrchestratorRunner:
         assert "Bash: uv run pytest tests/unit/test_runner.py -q" in verification_report
         assert "Write: /tmp/project/task_store.py" in verification_report
         assert "Decomposed placeholder should not leak" not in verification_report
+        assert (
+            result.value.summary["verification_report_sha256"]
+            == hashlib.sha256(verification_report.encode("utf-8")).hexdigest()
+        )
+        assert result.value.summary["task_results"] == [
+            {
+                "ac_index": 0,
+                "outcome": "succeeded",
+                "success": True,
+                "evidence_present": True,
+            },
+            {
+                "ac_index": 1,
+                "outcome": "succeeded",
+                "success": True,
+                "evidence_present": True,
+            },
+            {
+                "ac_index": 2,
+                "outcome": "succeeded",
+                "success": True,
+                "evidence_present": True,
+            },
+        ]
 
 
 class TestOrchestratorError:

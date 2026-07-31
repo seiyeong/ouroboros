@@ -10416,6 +10416,22 @@ class OrchestratorRunner:
             "max_parallel_workers": max_parallel_workers,
             "effective_parallel_workers": effective_workers,
             "verification_report": verification_report,
+            "verification_report_sha256": hashlib.sha256(
+                verification_report.encode("utf-8")
+            ).hexdigest(),
+            "task_results": [
+                {
+                    "ac_index": result.ac_index,
+                    "outcome": result.outcome.value if result.outcome is not None else None,
+                    "success": result.success,
+                    "evidence_present": bool(
+                        result.final_message.strip()
+                        or result.messages
+                        or result.typed_evidence is not None
+                    ),
+                }
+                for result in parallel_result.results
+            ],
             **self._task_summary(),
         }
 
