@@ -630,9 +630,18 @@ def _canonical_execution_receipt(summary: Mapping[str, object]) -> str | None:
         counts[key] = value
 
     total = counts["acceptance_criteria_count"]
+    parallel_execution = summary.get("parallel_execution")
+    report_header: str
+    if parallel_execution is True:
+        report_header = "Parallel Execution Verification Report"
+    elif parallel_execution is False and summary.get("execution_mode") == "direct":
+        report_header = "Direct Execution Verification Report"
+    else:
+        return None
+    if parallel_execution is False and counts["externally_satisfied_count"] != 0:
+        return None
     if (
-        summary.get("parallel_execution") is not True
-        or total == 0
+        total == 0
         or counts["satisfied_count"] != total
         or counts["success_count"] + counts["externally_satisfied_count"] != total
         or any(
@@ -660,7 +669,7 @@ def _canonical_execution_receipt(summary: Mapping[str, object]) -> str | None:
         return None
     if (
         task_results_start < 2
-        or report_lines[:2] != ["Parallel Execution Verification Report", expected_success_line]
+        or report_lines[:2] != [report_header, expected_success_line]
         or [line for line in report_lines[:task_results_start] if line.startswith("Success: ")]
         != [expected_success_line]
     ):

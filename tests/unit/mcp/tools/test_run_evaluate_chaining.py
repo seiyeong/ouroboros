@@ -419,6 +419,85 @@ async def test_chained_evaluation_artifact_accepts_renderer_output(event_store) 
     assert "## Durable Task Receipt" in artifact
 
 
+async def test_chained_evaluation_artifact_accepts_direct_receipt(event_store) -> None:
+    report = "\n".join(
+        (
+            "Direct Execution Verification Report",
+            "Success: 1/1",
+            "",
+            "## Task Results",
+        )
+    )
+    await event_store.append(
+        BaseEvent(
+            type="execution.terminal",
+            aggregate_type="execution",
+            aggregate_id="exec_direct_receipt",
+            data={
+                "session_id": "orch_receipt",
+                "status": "completed",
+                "summary": _canonical_execution_summary(
+                    report,
+                    parallel_execution=False,
+                    execution_mode="direct",
+                ),
+            },
+        )
+    )
+    run_result = MCPToolResult(
+        is_error=False,
+        meta={"execution_id": "exec_direct_receipt"},
+    )
+
+    artifact = await execution_handlers._chained_evaluation_artifact(
+        event_store,
+        run_result,
+        "orch_receipt",
+    )
+
+    assert artifact is not None
+    assert artifact.startswith("Run acceptance receipt:\n\n" + report)
+    assert "## Durable Task Receipt" in artifact
+
+
+async def test_chained_evaluation_artifact_rejects_direct_external_receipt(event_store) -> None:
+    report = "\n".join(
+        (
+            "Direct Execution Verification Report",
+            "Success: 1/1",
+            "",
+            "## Task Results",
+        )
+    )
+    await event_store.append(
+        BaseEvent(
+            type="execution.terminal",
+            aggregate_type="execution",
+            aggregate_id="exec_direct_external_receipt",
+            data={
+                "session_id": "orch_receipt",
+                "status": "completed",
+                "summary": _canonical_execution_summary(
+                    report,
+                    task_results=[_verified_task_receipt(outcome="satisfied_externally")],
+                    parallel_execution=False,
+                    execution_mode="direct",
+                    success_count=0,
+                    externally_satisfied_count=1,
+                ),
+            },
+        )
+    )
+
+    artifact = await execution_handlers._chained_evaluation_artifact(
+        event_store,
+        MCPToolResult(is_error=False, meta={"execution_id": "exec_direct_external_receipt"}),
+        "orch_receipt",
+    )
+
+    assert artifact is None
+
+
 async def test_chained_evaluation_artifact_requires_hash_bound_typed_task_receipt(
     event_store,
 ) -> None:
@@ -727,10 +806,38 @@ async def test_chained_evaluation_artifact_requires_matching_nonempty_receipt(
     assert artifact is None
 
 
+@pytest.mark.parametrize(
+    ("report", "summary_overrides", "expected_detail"),
+    [
+        pytest.param(
+            "Parallel Execution Verification Report\n"
+            "Success: 1/1\n"
+            "\n## Task Results\n\n"
+            "### Task 1: [COMPLETED] receipt\n"
+            "File Changes:\n- lazycodex_canary.txt\n"
+            "tests_passed: verify_command exit 0",
+            {},
+            "verify_command exit 0",
+            id="parallel",
+        ),
+        pytest.param(
+            "Direct Execution Verification Report\n"
+            "Success: 1/1\n"
+            "\n## Task Results\n"
+            "- Task 1: [COMPLETED] outcome=succeeded",
+            {"parallel_execution": False, "execution_mode": "direct"},
+            "Direct Execution Verification Report",
+            id="direct",
+        ),
+    ],
+)
 async def test_chained_evaluate_uses_durable_execution_receipt(
     event_store,
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    report: str,
+    summary_overrides: dict[str, object],
+    expected_detail: str,
 ) -> None:
     monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
     evaluate_calls: list[dict[str, Any]] = []
@@ -758,14 +865,7 @@ async def test_chained_evaluate_uses_durable_execution_receipt(
                     data={
                         "session_id": session_id_override,
                         "status": "completed",
-                        "summary": _canonical_execution_summary(
-                            "Parallel Execution Verification Report\n"
-                            "Success: 1/1\n"
-                            "\n## Task Results\n\n"
-                            "### Task 1: [COMPLETED] receipt\n"
-                            "File Changes:\n- lazycodex_canary.txt\n"
-                            "tests_passed: verify_command exit 0"
-                        ),
+                        "summary": _canonical_execution_summary(report, **summary_overrides),
                     },
                 )
             )
@@ -812,7 +912,7 @@ async def test_chained_evaluate_uses_durable_execution_receipt(
     await _wait_for_call(evaluate_calls)
     artifact = evaluate_calls[0]["artifact"]
     assert artifact.startswith("Run acceptance receipt:")
-    assert "verify_command exit 0" in artifact
+    assert expected_detail in artifact
     assert "run-only warning" not in artifact
 
 

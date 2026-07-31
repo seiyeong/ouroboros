@@ -448,7 +448,8 @@ fallback instead of retrying the failing call.
    **not** the formal 3-stage evaluator. With `auto_evaluate: true` (the default),
    the parent Run job stays non-terminal while its bounded chained evaluator runs.
    It becomes `completed` only after the same-session `execution.terminal` holds a
-   hash-bound canonical `Parallel Execution Verification Report` whose typed execution
+   hash-bound canonical `Parallel Execution Verification Report` or `Direct Execution
+   Verification Report`, whose typed execution
    summary lists every AC result, shows every AC satisfied with no failed, blocked,
    invalid, or skipped result, and binds each completed AC to an orchestrator verify-gate
    digest; then the evaluator must return `final_approved: true`. The report's
