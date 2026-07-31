@@ -336,6 +336,96 @@ class OrchestratorResult:
     duration_seconds: float = 0.0
 
 
+def _is_sha256_digest(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionVerifyEvidence:
+    workspace_digest: str
+    output_sha256: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "workspace_digest": self.workspace_digest,
+            "output_sha256": self.output_sha256,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> ExecutionVerifyEvidence | None:
+        expected_keys = frozenset({"schema_version", "workspace_digest", "output_sha256"})
+        if not _mapping_has_exact_keys(value, expected_keys) or not isinstance(value, Mapping):
+            return None
+        schema_version = value.get("schema_version")
+        workspace_digest = value.get("workspace_digest")
+        output_sha256 = value.get("output_sha256")
+        if (
+            type(schema_version) is not int
+            or schema_version != 1
+            or not _is_sha256_digest(workspace_digest)
+            or not _is_sha256_digest(output_sha256)
+        ):
+            return None
+        return cls(workspace_digest=workspace_digest, output_sha256=output_sha256)
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionTaskReceipt:
+    ac_index: int
+    outcome: str
+    success: bool
+    verify_evidence: ExecutionVerifyEvidence | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "ac_index": self.ac_index,
+            "outcome": self.outcome,
+            "success": self.success,
+            "verify_evidence": (
+                self.verify_evidence.to_dict() if self.verify_evidence is not None else None
+            ),
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> ExecutionTaskReceipt | None:
+        expected_keys = frozenset({"ac_index", "outcome", "success", "verify_evidence"})
+        if not _mapping_has_exact_keys(value, expected_keys) or not isinstance(value, Mapping):
+            return None
+        ac_index = value.get("ac_index")
+        outcome = value.get("outcome")
+        success = value.get("success")
+        verify_evidence_value = value.get("verify_evidence")
+        if (
+            type(ac_index) is not int
+            or ac_index < 0
+            or not isinstance(outcome, str)
+            or type(success) is not bool
+        ):
+            return None
+        verified_outcomes = {"succeeded", "satisfied_externally"}
+        known_outcomes = verified_outcomes | {"failed", "blocked", "invalid"}
+        if outcome not in known_outcomes or success is not (outcome in verified_outcomes):
+            return None
+        verify_evidence = (
+            None
+            if verify_evidence_value is None
+            else ExecutionVerifyEvidence.from_mapping(verify_evidence_value)
+        )
+        if verify_evidence_value is not None and verify_evidence is None:
+            return None
+        return cls(
+            ac_index=ac_index,
+            outcome=outcome,
+            success=success,
+            verify_evidence=verify_evidence,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class RecoverableFailurePause:
     """Structured pause decision for recoverable final runtime failures."""
@@ -10081,8 +10171,10 @@ class OrchestratorRunner:
         """
         from ouroboros.orchestrator.dependency_analyzer import ACNode, DependencyGraph
         from ouroboros.orchestrator.parallel_executor import (
+            ACExecutionResult,
             ParallelACExecutor,
             ParallelExecutionCancelled,
+            _VerifyGateOutcome,
             render_parallel_completion_message,
             render_parallel_verification_report,
         )
@@ -10398,6 +10490,37 @@ class OrchestratorRunner:
             len(seed.acceptance_criteria),
             max_decomposition_depth=max_decomposition_depth,
         )
+
+        def task_receipt(result: ACExecutionResult) -> dict[str, object]:
+            verify_gate_outcome = result.verify_gate_outcome
+            workspace_digest = (
+                verify_gate_outcome.workspace_digest
+                if isinstance(verify_gate_outcome, _VerifyGateOutcome)
+                else None
+            )
+            verify_evidence = (
+                ExecutionVerifyEvidence(
+                    workspace_digest=workspace_digest,
+                    output_sha256=hashlib.sha256(
+                        verify_gate_outcome.output_tail.encode("utf-8")
+                    ).hexdigest(),
+                )
+                if (
+                    isinstance(verify_gate_outcome, _VerifyGateOutcome)
+                    and verify_gate_outcome.passed is True
+                    and verify_gate_outcome.workspace_mutated is False
+                    and isinstance(workspace_digest, str)
+                    and _is_sha256_digest(workspace_digest)
+                )
+                else None
+            )
+            return ExecutionTaskReceipt(
+                ac_index=result.ac_index,
+                outcome=result.outcome.value if result.outcome is not None else "unknown",
+                success=result.success,
+                verify_evidence=verify_evidence,
+            ).to_dict()
+
         execution_summary = {
             "goal": seed.goal,
             "acceptance_criteria_count": len(seed.acceptance_criteria),
@@ -10419,19 +10542,7 @@ class OrchestratorRunner:
             "verification_report_sha256": hashlib.sha256(
                 verification_report.encode("utf-8")
             ).hexdigest(),
-            "task_results": [
-                {
-                    "ac_index": result.ac_index,
-                    "outcome": result.outcome.value if result.outcome is not None else None,
-                    "success": result.success,
-                    "evidence_present": bool(
-                        result.final_message.strip()
-                        or result.messages
-                        or result.typed_evidence is not None
-                    ),
-                }
-                for result in parallel_result.results
-            ],
+            "task_results": [task_receipt(result) for result in parallel_result.results],
             **self._task_summary(),
         }
 
@@ -11982,6 +12093,8 @@ Note: This is a resumed session. Please continue from where execution was interr
 
 
 __all__ = [
+    "ExecutionTaskReceipt",
+    "ExecutionVerifyEvidence",
     "ExecutionCancelledError",
     "OrchestratorError",
     "OrchestratorResult",

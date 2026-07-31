@@ -85,6 +85,7 @@ from ouroboros.orchestrator.execution_authority import (
 from ouroboros.orchestrator.heartbeat import is_holder_alive
 from ouroboros.orchestrator.model_routing import tier_from_model_tier_arg
 from ouroboros.orchestrator.runner import (
+    ExecutionTaskReceipt,
     OrchestratorRunner,
     clear_cancellation,
     request_cancellation,
@@ -675,23 +676,21 @@ def _canonical_execution_receipt(summary: Mapping[str, object]) -> str | None:
         f"verification_report_sha256: {verification_report_sha256}",
     ]
     for task_result in task_results:
-        if not isinstance(task_result, Mapping):
-            return None
-        ac_index = task_result.get("ac_index")
-        outcome = task_result.get("outcome")
+        task_receipt = ExecutionTaskReceipt.from_mapping(task_result)
         if (
-            type(ac_index) is not int
-            or ac_index < 0
-            or not isinstance(outcome, str)
-            or outcome not in outcome_counts
-            or task_result.get("success") is not True
-            or task_result.get("evidence_present") is not True
+            task_receipt is None
+            or task_receipt.outcome not in outcome_counts
+            or task_receipt.success is not True
+            or task_receipt.verify_evidence is None
         ):
             return None
-        task_indexes.add(ac_index)
-        outcome_counts[outcome] += 1
+        task_indexes.add(task_receipt.ac_index)
+        outcome_counts[task_receipt.outcome] += 1
         durable_task_lines.append(
-            f"- Task {ac_index + 1}: [COMPLETED] outcome={outcome}; evidence=recorded"
+            f"- Task {task_receipt.ac_index + 1}: [COMPLETED] "
+            f"outcome={task_receipt.outcome}; "
+            f"verify_workspace_digest={task_receipt.verify_evidence.workspace_digest}; "
+            f"verify_output_sha256={task_receipt.verify_evidence.output_sha256}"
         )
     if task_indexes != set(range(total)):
         return None

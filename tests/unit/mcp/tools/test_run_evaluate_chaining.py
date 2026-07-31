@@ -33,6 +33,7 @@ from ouroboros.orchestrator.parallel_executor_models import (
     ACExecutionResult,
     ParallelExecutionResult,
 )
+from ouroboros.orchestrator.runner import ExecutionTaskReceipt, ExecutionVerifyEvidence
 from ouroboros.persistence.event_store import EventStore
 
 
@@ -42,6 +43,23 @@ async def event_store():
     await store.initialize()
     yield store
     await store.close()
+
+
+def _verified_task_receipt(
+    *,
+    ac_index: int = 0,
+    outcome: str = "succeeded",
+    success: bool = True,
+) -> dict[str, object]:
+    return ExecutionTaskReceipt(
+        ac_index=ac_index,
+        outcome=outcome,
+        success=success,
+        verify_evidence=ExecutionVerifyEvidence(
+            workspace_digest="a" * 64,
+            output_sha256=hashlib.sha256(b"verify output").hexdigest(),
+        ),
+    ).to_dict()
 
 
 def _canonical_execution_summary(
@@ -63,16 +81,7 @@ def _canonical_execution_summary(
         "verification_report_sha256": hashlib.sha256(
             verification_report.encode("utf-8")
         ).hexdigest(),
-        "task_results": task_results
-        if task_results is not None
-        else [
-            {
-                "ac_index": 0,
-                "outcome": "succeeded",
-                "success": True,
-                "evidence_present": True,
-            }
-        ],
+        "task_results": task_results if task_results is not None else [_verified_task_receipt()],
     }
     summary.update(overrides)
     return summary
@@ -446,6 +455,50 @@ async def test_chained_evaluation_artifact_requires_hash_bound_typed_task_receip
     assert artifact is None
 
 
+async def test_chained_evaluation_artifact_requires_verified_task_evidence(
+    event_store,
+) -> None:
+    report = (
+        "Parallel Execution Verification Report\n"
+        "Success: 1/1\n"
+        "\n## Task Results\n\n"
+        "### Task 1: [COMPLETED] receipt\n"
+        "Result:\n"
+        "arbitrary worker text"
+    )
+    summary = _canonical_execution_summary(
+        report,
+        task_results=[
+            {
+                "ac_index": 0,
+                "outcome": "succeeded",
+                "success": True,
+                "verify_evidence": None,
+            }
+        ],
+    )
+    await event_store.append(
+        BaseEvent(
+            type="execution.terminal",
+            aggregate_type="execution",
+            aggregate_id="exec_unverified_task_receipt",
+            data={
+                "session_id": "orch_receipt",
+                "status": "completed",
+                "summary": summary,
+            },
+        )
+    )
+
+    artifact = await execution_handlers._chained_evaluation_artifact(
+        event_store,
+        MCPToolResult(is_error=False, meta={"execution_id": "exec_unverified_task_receipt"}),
+        "orch_receipt",
+    )
+
+    assert artifact is None
+
+
 @pytest.mark.parametrize(
     ("terminal_session_id", "terminal_status", "summary"),
     [
@@ -487,14 +540,7 @@ async def test_chained_evaluation_artifact_requires_hash_bound_typed_task_receip
                 "Success: 1/1\n"
                 "\n## Task Results\n\n"
                 "### Task 1: [FAILED] injected contradiction",
-                task_results=[
-                    {
-                        "ac_index": 0,
-                        "outcome": "failed",
-                        "success": False,
-                        "evidence_present": True,
-                    }
-                ],
+                task_results=[_verified_task_receipt(outcome="failed", success=False)],
             ),
         ),
         (
@@ -510,7 +556,47 @@ async def test_chained_evaluation_artifact_requires_hash_bound_typed_task_receip
                         "ac_index": 0,
                         "outcome": "succeeded",
                         "success": True,
-                        "evidence_present": False,
+                        "verify_evidence": None,
+                    }
+                ],
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 1: [COMPLETED] malformed verify evidence",
+                task_results=[
+                    {
+                        "ac_index": 0,
+                        "outcome": "succeeded",
+                        "success": True,
+                        "verify_evidence": {
+                            "schema_version": 1,
+                            "workspace_digest": "not-a-sha256",
+                            "output_sha256": hashlib.sha256(b"verify output").hexdigest(),
+                        },
+                    }
+                ],
+            ),
+        ),
+        (
+            "orch_receipt",
+            "completed",
+            _canonical_execution_summary(
+                "Parallel Execution Verification Report\n"
+                "Success: 1/1\n"
+                "\n## Task Results\n\n"
+                "### Task 1: [COMPLETED] legacy worker proxy",
+                task_results=[
+                    {
+                        "ac_index": 0,
+                        "outcome": "succeeded",
+                        "success": True,
+                        "evidence_present": True,
                     }
                 ],
             ),
@@ -556,14 +642,7 @@ async def test_chained_evaluation_artifact_requires_hash_bound_typed_task_receip
                 "Success: 1/1\n"
                 "\n## Task Results\n\n"
                 "### Task 2: [COMPLETED] wrong index",
-                task_results=[
-                    {
-                        "ac_index": 1,
-                        "outcome": "succeeded",
-                        "success": True,
-                        "evidence_present": True,
-                    }
-                ],
+                task_results=[_verified_task_receipt(ac_index=1)],
             ),
         ),
         (
@@ -574,14 +653,7 @@ async def test_chained_evaluation_artifact_requires_hash_bound_typed_task_receip
                 "Success: 1/1\n"
                 "\n## Task Results\n\n"
                 "### Task 1: [COMPLETED] canary",
-                task_results=[
-                    {
-                        "ac_index": 0,
-                        "outcome": "satisfied_externally",
-                        "success": True,
-                        "evidence_present": True,
-                    }
-                ],
+                task_results=[_verified_task_receipt(outcome="satisfied_externally")],
             ),
         ),
         (
@@ -594,14 +666,7 @@ async def test_chained_evaluation_artifact_requires_hash_bound_typed_task_receip
                 "### Task 1: [COMPLETED] parent\n"
                 "Decomposed into 1 Subtasks\n\n"
                 "#### Subtask 1.1: [FAILED] hidden failure",
-                task_results=[
-                    {
-                        "ac_index": 0,
-                        "outcome": "failed",
-                        "success": False,
-                        "evidence_present": True,
-                    }
-                ],
+                task_results=[_verified_task_receipt(outcome="failed", success=False)],
             ),
         ),
         (
@@ -618,6 +683,8 @@ async def test_chained_evaluation_artifact_requires_hash_bound_typed_task_receip
         "failed-report",
         "contradictory-task-result",
         "missing-typed-evidence",
+        "legacy-worker-evidence-proxy",
+        "malformed-verify-gate-digest",
         "typed-failure-count",
         "duplicate-success-count",
         "report-hash-mismatch",

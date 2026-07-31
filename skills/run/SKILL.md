@@ -450,9 +450,10 @@ fallback instead of retrying the failing call.
    It becomes `completed` only after the same-session `execution.terminal` holds a
    hash-bound canonical `Parallel Execution Verification Report` whose typed execution
    summary lists every AC result, shows every AC satisfied with no failed, blocked,
-   invalid, or skipped result, and records evidence for each completed AC; then the
-   evaluator must return `final_approved: true`. The report's worker-written body is
-   context only: durable typed task results are the completion authority.
+   invalid, or skipped result, and binds each completed AC to an orchestrator verify-gate
+   digest; then the evaluator must return `final_approved: true`. The report's
+   worker-written body is context only: durable typed task results and verify-gate
+   evidence are the completion authority.
    A missing, malformed, or incomplete receipt, rejection, timeout, enqueue failure,
    or missing final verdict terminates the parent Run job as `failed`; it must never
    be reported as a completed run.

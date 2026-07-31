@@ -8398,6 +8398,7 @@ class TestOrchestratorRunner:
         from ouroboros.orchestrator.parallel_executor import (
             ACExecutionResult,
             ParallelExecutionResult,
+            _VerifyGateOutcome,
         )
 
         runner = OrchestratorRunner(MagicMock(), mock_event_store, mock_console)
@@ -8425,6 +8426,12 @@ class TestOrchestratorRunner:
             ),
             final_message="Implemented task storage and verified behavior.",
         )
+        verify_gate_outcome = _VerifyGateOutcome(
+            passed=True,
+            reason=None,
+            output_tail="",
+            workspace_digest="a" * 64,
+        )
 
         class FakeParallelExecutor:
             def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -8440,18 +8447,21 @@ class TestOrchestratorRunner:
                             is_decomposed=True,
                             sub_results=(sub_result,),
                             final_message="Decomposed placeholder should not leak",
+                            verify_gate_outcome=verify_gate_outcome,
                         ),
                         ACExecutionResult(
                             ac_index=1,
                             ac_content=sample_seed.acceptance_criteria[1],
                             success=True,
                             final_message="Listed tasks correctly.",
+                            verify_gate_outcome=verify_gate_outcome,
                         ),
                         ACExecutionResult(
                             ac_index=2,
                             ac_content=sample_seed.acceptance_criteria[2],
                             success=True,
                             final_message="Deleted tasks correctly.",
+                            verify_gate_outcome=verify_gate_outcome,
                         ),
                     ),
                     success_count=3,
@@ -8512,19 +8522,31 @@ class TestOrchestratorRunner:
                 "ac_index": 0,
                 "outcome": "succeeded",
                 "success": True,
-                "evidence_present": True,
+                "verify_evidence": {
+                    "schema_version": 1,
+                    "workspace_digest": "a" * 64,
+                    "output_sha256": hashlib.sha256(b"").hexdigest(),
+                },
             },
             {
                 "ac_index": 1,
                 "outcome": "succeeded",
                 "success": True,
-                "evidence_present": True,
+                "verify_evidence": {
+                    "schema_version": 1,
+                    "workspace_digest": "a" * 64,
+                    "output_sha256": hashlib.sha256(b"").hexdigest(),
+                },
             },
             {
                 "ac_index": 2,
                 "outcome": "succeeded",
                 "success": True,
-                "evidence_present": True,
+                "verify_evidence": {
+                    "schema_version": 1,
+                    "workspace_digest": "a" * 64,
+                    "output_sha256": hashlib.sha256(b"").hexdigest(),
+                },
             },
         ]
 
