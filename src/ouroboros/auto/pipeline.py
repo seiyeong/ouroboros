@@ -37,7 +37,7 @@ from ouroboros.auto.handoff_contract import (
 )
 from ouroboros.auto.interview_driver import AutoInterviewDriver
 from ouroboros.auto.lateral_routing import select_persona_for_qa_failure
-from ouroboros.auto.ledger import AssumptionRecord, SeedDraftLedger
+from ouroboros.auto.ledger import AssumptionRecord, LedgerStatus, SeedDraftLedger
 from ouroboros.auto.ledger_seed import (
     PARTIAL_SEED_GENERATION_MODE,
     brownfield_context_from_cwd,
@@ -2866,8 +2866,12 @@ class AutoPipeline:
 
             if attempt < max_attempts:
                 current_seed = normalize_execution_acceptance(
-                    await self._repair_seed_after_qa(
-                        state, current_seed, qa_result, attempt=attempt
+                    _preserve_ledger_seed_contracts(
+                        await self._repair_seed_after_qa(
+                            state, current_seed, qa_result, attempt=attempt
+                        ),
+                        ledger=ledger,
+                        cwd=state.cwd,
                     )
                 )
                 current_review = SeedReviewer(self.grade_gate).review(
@@ -4916,6 +4920,66 @@ def _is_seed_qa_diagnostic_constraint(constraint: str) -> bool:
         or "# lateral thinking:" in lowered
         or "qa differences:" in lowered
         or "qa suggestions:" in lowered
+        or lowered.startswith("resolve seed qa feedback")
+        or lowered.startswith("preserve ledger non-goals")
+        or lowered.startswith("constraints must contain only")
+        or lowered.startswith("address this seed qa finding")
+        or lowered.startswith("use this bounded implementation approach to resolve seed qa")
+        or lowered.startswith("seed metadata must satisfy the readiness gate")
+        or lowered.startswith("acceptance criteria must be direct executable checks")
+        or lowered.startswith("do not include qa grader commentary")
+        or lowered.startswith("[from-auto][safe-default-synthesis]")
+    )
+
+
+def _preserve_ledger_seed_contracts(
+    seed: Seed,
+    ledger: SeedDraftLedger,
+    *,
+    cwd: str,
+) -> Seed:
+    contract_seed = synthesize_seed_from_ledger(
+        ledger,
+        brownfield_context=brownfield_context_from_cwd(cwd),
+    )
+    active_statuses = {
+        LedgerStatus.CONFIRMED,
+        LedgerStatus.DEFAULTED,
+        LedgerStatus.INFERRED,
+    }
+    ledger_constraints = tuple(
+        entry.value.strip()
+        for entry in ledger.sections["constraints"].entries
+        if entry.status in active_statuses
+        and ".candidate." not in entry.key
+        and not _is_seed_qa_diagnostic_constraint(entry.value)
+    )
+    non_goals = tuple(item for item in contract_seed.constraints if item.startswith("Non-goal: "))
+    constraints = tuple(
+        dict.fromkeys(
+            (
+                *(item for item in seed.constraints if not _is_seed_qa_diagnostic_constraint(item)),
+                *ledger_constraints,
+                *non_goals,
+            )
+        )
+    )
+    runtime_field = next(
+        field for field in contract_seed.ontology_schema.fields if field.name == "runtime_context"
+    )
+    ontology_fields = tuple(
+        field for field in seed.ontology_schema.fields if field.name != "runtime_context"
+    )
+    ontology_schema = seed.ontology_schema.model_copy(
+        update={"fields": (*ontology_fields, runtime_field)}
+    )
+    return seed.model_copy(
+        update={
+            "brownfield_context": contract_seed.brownfield_context,
+            "constraints": constraints,
+            "ontology_schema": ontology_schema,
+            "exit_conditions": seed.exit_conditions or contract_seed.exit_conditions,
+        }
     )
 
 
@@ -4941,9 +5005,9 @@ def _normalized_seed_qa_lateral_feedback(lateral_result: LateralResult) -> tuple
         and not _is_seed_qa_recovery_transcript(summary)
         and not (persona_prefix and summary.casefold().startswith(f"{persona_prefix}:"))
     ):
-        repairs.append(f"Use this bounded implementation approach to resolve Seed QA: {summary}")
+        repairs.append(summary)
     if _is_clean_seed_qa_lateral_decision(decision, raw_text=lateral_result.text):
-        repairs.append(f"Use this bounded implementation approach to resolve Seed QA: {decision}")
+        repairs.append(decision.removeprefix("Decision:").removeprefix("decision:").strip())
     if not repairs:
         repairs.append(
             "Resolve Seed QA feedback before execution without copying recovery persona prompts, failed-run transcripts, or diagnostic prose."
