@@ -10253,11 +10253,16 @@ class OrchestratorRunner:
                     success=success,
                     session_id=tracker.session_id,
                     execution_id=exec_id,
-                    summary={
-                        "goal": seed.goal,
-                        "acceptance_criteria_count": len(seed.acceptance_criteria),
-                        **self._task_summary(),
-                    },
+                    summary=(
+                        completion_summary
+                        if terminal_status == SessionStatus.COMPLETED.value
+                        and completion_summary is not None
+                        else {
+                            "goal": seed.goal,
+                            "acceptance_criteria_count": len(seed.acceptance_criteria),
+                            **self._task_summary(),
+                        }
+                    ),
                     messages_processed=messages_processed,
                     final_message=final_message,
                     duration_seconds=duration,
@@ -12227,7 +12232,12 @@ Note: This is a resumed session. Please continue from where execution was interr
                     success=success,
                     session_id=session_id,
                     execution_id=tracker.execution_id,
-                    summary={"resumed": True, **self._task_summary()},
+                    summary=(
+                        {"resumed": True, **completion_summary}
+                        if terminal_status == SessionStatus.COMPLETED.value
+                        and completion_summary is not None
+                        else {"resumed": True, **self._task_summary()}
+                    ),
                     messages_processed=messages_processed,
                     final_message=final_message,
                     duration_seconds=duration,

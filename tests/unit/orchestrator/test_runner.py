@@ -1068,6 +1068,7 @@ class TestOrchestratorRunner:
             if call.args and call.args[0].type == "execution.terminal"
         ]
         summary = terminal_events[-1].data["summary"]
+        assert result.value.summary == summary
         total = len(sample_seed.acceptance_criteria)
         assert summary["parallel_execution"] is False
         assert summary["execution_mode"] == "direct"
@@ -6815,6 +6816,10 @@ class TestOrchestratorRunner:
             if call.args and call.args[0].type == "execution.terminal"
         ]
         summary = terminal_events[-1].data["summary"]
+        assert result.value.summary["resumed"] is True
+        assert {
+            key: value for key, value in result.value.summary.items() if key != "resumed"
+        } == summary
         total = len(sample_seed.acceptance_criteria)
         assert summary["parallel_execution"] is False
         assert summary["execution_mode"] == "direct"

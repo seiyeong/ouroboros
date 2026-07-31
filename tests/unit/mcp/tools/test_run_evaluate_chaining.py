@@ -460,6 +460,28 @@ async def test_chained_evaluation_artifact_accepts_direct_receipt(event_store) -
     assert "## Durable Task Receipt" in artifact
 
 
+def test_verification_artifact_prefers_direct_runner_receipt() -> None:
+    report = "\n".join(
+        (
+            "Direct Execution Verification Report",
+            "Success: 1/1",
+            "",
+            "## Task Results",
+        )
+    )
+
+    artifact = execution_handlers.ExecuteSeedHandler._get_verification_artifact(
+        _canonical_execution_summary(
+            report,
+            parallel_execution=False,
+            execution_mode="direct",
+        ),
+        "unverified agent prose",
+    )
+
+    assert artifact == report
+
+
 def test_canonical_execution_receipt_rejects_unlabeled_direct_mode() -> None:
     report = "\n".join(
         (
