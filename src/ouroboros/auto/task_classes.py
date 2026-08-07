@@ -14,7 +14,7 @@ result-envelope surface (L1-e).
 
 Design constraints honored:
 
-- **Plain strings, no LLM, no eval set.** The 7-class enum is frozen at
+- **Plain strings, no LLM, no eval set.** The task-class enum is extended only
   this PR; growth happens via PR-per-class (~10 LoC + a unit test),
   not via re-curating a training corpus.
 - **Decoupled from `domain_profile.DomainProfile`.** The existing
@@ -86,6 +86,7 @@ class TaskClass(StrEnum):
 
     LIBRARY = "library"
     CLI = "cli"
+    WEB_APP = "web_app"
     WEB_SERVICE = "web_service"
     WEBHOOK = "webhook"
     DATA_PIPELINE = "data_pipeline"
@@ -159,6 +160,16 @@ _CATALOG: dict[TaskClass, TaskClassProfile] = {
             "An invalid argument exits with a non-zero status and prints a human-readable error.",
         ),
         probes=("headless_run", "stdout_golden"),
+    ),
+    TaskClass.WEB_APP: _profile(
+        name=TaskClass.WEB_APP,
+        completion=CompletionMode.PRODUCT_COMPLETE,
+        ac_template=(
+            "The documented browser flow completes through the rendered user interface.",
+            "Validation and error states are visible without an unhandled browser exception.",
+            "The application launches through the documented command with all required assets.",
+        ),
+        probes=("headless_run", "browser_flow"),
     ),
     TaskClass.WEB_SERVICE: _profile(
         name=TaskClass.WEB_SERVICE,

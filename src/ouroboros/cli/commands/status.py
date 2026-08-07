@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 from typing import Annotated, Any
 
 from rich.table import Table
@@ -24,7 +25,11 @@ from ouroboros.backends import (
 )
 from ouroboros.cli.commands.config import _load_config, _resolve_db_path
 from ouroboros.cli.formatters.panels import print_error, print_info
-from ouroboros.cli.formatters.tables import create_status_table, print_table
+from ouroboros.cli.formatters.tables import (
+    create_key_value_table,
+    create_table,
+    print_table,
+)
 from ouroboros.config.loader import load_config
 from ouroboros.mcp.tools.projection_handlers import ProjectionQueryHandler
 
@@ -146,6 +151,50 @@ _STATUS_RUN_EXIT_GENERIC_ERROR = 1
 _STATUS_RUN_EXIT_UNKNOWN_RUN = 2
 _STATUS_RUN_EXIT_MALFORMED_INPUT = 64
 
+_EXECUTION_EVENT_STATUS = {
+    "execution.completed": "complete",
+    "execution.failed": "failed",
+    "execution.plan.created": "running",
+    "execution.run.configuration_resolved": "running",
+    "execution.started": "running",
+    "workflow.progress.updated": "running",
+}
+
+
+def _configured_event_store_path() -> Path:
+    data, config_path = _load_config()
+    db_path = _database_file_path(data, config_path)
+    if not db_path.exists():
+        raise FileNotFoundError(f"configured database does not exist: {db_path}")
+    if not db_path.is_file():
+        raise OSError(f"configured database is not a file: {db_path}")
+    return db_path
+
+
+def _event_store_connection(db_path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _event_status(event_type: str, raw_payload: str) -> str | None:
+    if event_type == "execution.terminal":
+        try:
+            payload = json.loads(raw_payload)
+        except (json.JSONDecodeError, TypeError):
+            return "unknown"
+        status = payload.get("status") if isinstance(payload, dict) else None
+        return str(status).strip().lower() if status else "unknown"
+    return _EXECUTION_EVENT_STATUS.get(event_type)
+
+
+def _event_count(db_path: Path) -> int:
+    with _event_store_connection(db_path) as connection:
+        row = connection.execute("SELECT COUNT(*) AS event_count FROM events").fetchone()
+    if row is None:
+        raise sqlite3.DatabaseError("event count query returned no row")
+    return int(row["event_count"])
+
 
 def _is_unknown_run_error(message: str) -> bool:
     lowered = message.lower()
@@ -258,13 +307,60 @@ def executions(
 
     Shows execution history with status information.
     """
-    # Placeholder implementation with example data
-    example_data = [
-        {"name": "exec-001", "status": "complete"},
-        {"name": "exec-002", "status": "running"},
-        {"name": "exec-003", "status": "failed"},
+    if limit <= 0:
+        print_error("Execution status failed: limit must be a positive integer")
+        raise typer.Exit(_STATUS_RUN_EXIT_MALFORMED_INPUT)
+    try:
+        with _event_store_connection(_configured_event_store_path()) as connection:
+            query = (
+                "WITH ranked AS ("
+                "SELECT aggregate_id, event_type, payload, timestamp, id, "
+                "ROW_NUMBER() OVER (PARTITION BY aggregate_id ORDER BY "
+                "CASE WHEN event_type IN ("
+                "'execution.terminal', 'execution.completed', 'execution.failed'"
+                ") THEN 0 ELSE 1 END, timestamp DESC, id DESC) AS event_rank "
+                "FROM events WHERE aggregate_type = 'execution' "
+                "AND event_type IN ("
+                "'execution.terminal', 'execution.completed', 'execution.failed', "
+                "'execution.plan.created', 'execution.run.configuration_resolved', "
+                "'execution.started', 'workflow.progress.updated')) "
+                "SELECT aggregate_id, event_type, payload, timestamp "
+                "FROM ranked WHERE event_rank = 1 "
+                "ORDER BY timestamp DESC, id DESC"
+            )
+            parameters: tuple[int, ...] = ()
+            if not all_:
+                query += " LIMIT ?"
+                parameters = (limit,)
+            persisted = connection.execute(query, parameters).fetchall()
+    except (OSError, sqlite3.Error, typer.Exit) as exc:
+        if isinstance(exc, typer.Exit):
+            raise
+        print_error(f"Database unavailable: {exc}")
+        raise typer.Exit(_STATUS_RUN_EXIT_GENERIC_ERROR) from exc
+
+    rows = [
+        {
+            "name": str(row["aggregate_id"]),
+            "status": _event_status(str(row["event_type"]), str(row["payload"])) or "unknown",
+        }
+        for row in persisted
     ]
-    table = create_status_table(example_data, "Recent Executions")
+    table = create_table("Recent Executions")
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("Status", justify="center")
+    for row in rows:
+        status = row["status"]
+        style = {
+            "blocked": "warning",
+            "cancelled": "warning",
+            "complete": "success",
+            "completed": "success",
+            "failed": "error",
+            "running": "success",
+            "unknown": "warning",
+        }.get(status, "warning")
+        table.add_row(row["name"], Text(status, style=style))
     print_table(table)
 
     if not all_:
@@ -286,10 +382,67 @@ def execution(
 
     Displays execution metadata, progress, and optionally events.
     """
-    # Placeholder implementation
-    print_info(f"Would show details for execution: {execution_id}")
+    try:
+        with _event_store_connection(_configured_event_store_path()) as connection:
+            persisted = connection.execute(
+                "SELECT aggregate_id, event_type, payload, timestamp "
+                "FROM events WHERE aggregate_id = ? OR "
+                "(json_valid(payload) AND ("
+                "json_extract(payload, '$.execution_id') = ? OR "
+                "json_extract(payload, '$.parent_execution_id') = ?)) "
+                "ORDER BY timestamp DESC, id DESC",
+                (execution_id, execution_id, execution_id),
+            ).fetchall()
+    except (OSError, sqlite3.Error, typer.Exit) as exc:
+        if isinstance(exc, typer.Exit):
+            raise
+        print_error(f"Database unavailable: {exc}")
+        raise typer.Exit(_STATUS_RUN_EXIT_GENERIC_ERROR) from exc
+    if not persisted:
+        print_error(f"Execution status failed: no persisted execution found: {execution_id}")
+        raise typer.Exit(_STATUS_RUN_EXIT_UNKNOWN_RUN)
+
+    status_rows = sorted(
+        persisted,
+        key=lambda row: (
+            str(row["event_type"])
+            not in {"execution.terminal", "execution.completed", "execution.failed"}
+        ),
+    )
+    status = next(
+        (
+            resolved
+            for row in status_rows
+            if (
+                resolved := _event_status(str(row["event_type"]), str(row["payload"]))
+            )
+            is not None
+        ),
+        "unknown",
+    )
+    print_table(
+        create_key_value_table(
+            {
+                "Execution ID": execution_id,
+                "Status": status,
+                "Latest event": str(persisted[0]["event_type"]),
+                "Updated": str(persisted[0]["timestamp"]),
+            },
+            "Execution Details",
+        )
+    )
     if events:
-        print_info("Would include event history")
+        table = create_table("Execution Events")
+        table.add_column("Timestamp", no_wrap=True)
+        table.add_column("Event", style="cyan")
+        table.add_column("Status")
+        for row in reversed(persisted):
+            table.add_row(
+                str(row["timestamp"]),
+                str(row["event_type"]),
+                _event_status(str(row["event_type"]), str(row["payload"])) or "",
+            )
+        print_table(table)
 
 
 _CREDENTIAL_PROVIDER_BY_LLM_BACKEND = {
@@ -578,7 +731,23 @@ def health() -> None:
                 except OSError as exc:
                     checks.append(_health_row("Database", "error", f"not readable: {exc}"))
                 else:
-                    checks.append(_health_row("Database", "ok", db_detail))
+                    if db_path.stat().st_size == 0:
+                        checks.append(_health_row("Database", "ok", db_detail))
+                    else:
+                        try:
+                            event_count = _event_count(db_path)
+                        except (OSError, sqlite3.Error) as exc:
+                            checks.append(
+                                _health_row("Database", "error", f"invalid event store: {exc}")
+                            )
+                        else:
+                            checks.append(
+                                _health_row(
+                                    "Database",
+                                    "ok",
+                                    f"{db_detail}; events={event_count}",
+                                )
+                            )
         except Exception as exc:
             checks.append(_health_row("Database", "error", str(exc)))
 

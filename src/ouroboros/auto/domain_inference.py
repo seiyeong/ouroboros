@@ -309,6 +309,23 @@ def _matches_web_service(ledger: SeedDraftLedger) -> bool:
     return api_signal
 
 
+def _matches_web_app(ledger: SeedDraftLedger) -> bool:
+    outputs = _section_text(ledger, "outputs")
+    runtime = _section_text(ledger, "runtime_context")
+    goal = _goal_text(ledger)
+    text = " ".join((outputs, runtime, goal))
+    return _any_of(
+        text,
+        (
+            "browser application",
+            "browser ui",
+            "frontend",
+            "web app",
+            "web ui",
+        ),
+    )
+
+
 def _matches_data_pipeline(ledger: SeedDraftLedger) -> bool:
     inputs = _section_text(ledger, "inputs")
     outputs = _section_text(ledger, "outputs")
@@ -366,8 +383,9 @@ def _matches_library(ledger: SeedDraftLedger) -> bool:
     # many false positives that shadowed cli / web_service inference
     # under ledger_only closures. The remaining keywords are
     # library-distinctive surface terms. See #1170 R2 evidence.
+    library_text = (outputs + " " + goal).replace("package.json", " ")
     return _any_of(
-        outputs + " " + goal,
+        library_text,
         (
             "library",
             "package",
@@ -382,6 +400,7 @@ def _matches_library(ledger: SeedDraftLedger) -> bool:
 _PATTERN_REGISTRY: dict[TaskClass, _PatternFn] = {
     TaskClass.CLI: _matches_cli,
     TaskClass.WEBHOOK: _matches_webhook,
+    TaskClass.WEB_APP: _matches_web_app,
     TaskClass.WEB_SERVICE: _matches_web_service,
     TaskClass.DATA_PIPELINE: _matches_data_pipeline,
     TaskClass.GAME_2D: _matches_game_2d,
