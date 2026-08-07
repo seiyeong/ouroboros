@@ -312,33 +312,40 @@ def executions(
         raise typer.Exit(_STATUS_RUN_EXIT_MALFORMED_INPUT)
     try:
         with _event_store_connection(_configured_event_store_path()) as connection:
-            persisted = connection.execute(
-                "SELECT aggregate_id, event_type, payload, timestamp "
+            query = (
+                "WITH ranked AS ("
+                "SELECT aggregate_id, event_type, payload, timestamp, id, "
+                "ROW_NUMBER() OVER (PARTITION BY aggregate_id ORDER BY "
+                "CASE WHEN event_type IN ("
+                "'execution.terminal', 'execution.completed', 'execution.failed'"
+                ") THEN 0 ELSE 1 END, timestamp DESC, id DESC) AS event_rank "
                 "FROM events WHERE aggregate_type = 'execution' "
                 "AND event_type IN ("
                 "'execution.terminal', 'execution.completed', 'execution.failed', "
                 "'execution.plan.created', 'execution.run.configuration_resolved', "
-                "'execution.started', 'workflow.progress.updated') "
+                "'execution.started', 'workflow.progress.updated')) "
+                "SELECT aggregate_id, event_type, payload, timestamp "
+                "FROM ranked WHERE event_rank = 1 "
                 "ORDER BY timestamp DESC, id DESC"
-            ).fetchall()
+            )
+            parameters: tuple[int, ...] = ()
+            if not all_:
+                query += " LIMIT ?"
+                parameters = (limit,)
+            persisted = connection.execute(query, parameters).fetchall()
     except (OSError, sqlite3.Error, typer.Exit) as exc:
         if isinstance(exc, typer.Exit):
             raise
         print_error(f"Database unavailable: {exc}")
         raise typer.Exit(_STATUS_RUN_EXIT_GENERIC_ERROR) from exc
 
-    latest_by_execution: dict[str, sqlite3.Row] = {}
-    for row in persisted:
-        latest_by_execution.setdefault(str(row["aggregate_id"]), row)
     rows = [
         {
-            "name": execution_id,
+            "name": str(row["aggregate_id"]),
             "status": _event_status(str(row["event_type"]), str(row["payload"])) or "unknown",
         }
-        for execution_id, row in latest_by_execution.items()
+        for row in persisted
     ]
-    if not all_:
-        rows = rows[:limit]
     table = create_table("Recent Executions")
     table.add_column("Name", style="cyan", no_wrap=True)
     table.add_column("Status", justify="center")
