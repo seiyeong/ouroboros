@@ -314,12 +314,16 @@ def _matches_web_app(ledger: SeedDraftLedger) -> bool:
     runtime = _section_text(ledger, "runtime_context")
     goal = _goal_text(ledger)
     text = " ".join((outputs, runtime, goal))
-    browser_signal = _any_of(text, ("browser", "web ui", "web app", "frontend"))
-    interaction_signal = _any_of(
+    return _any_of(
         text,
-        ("form", "panel", "page", "dom", "interactive", "validation message"),
+        (
+            "browser application",
+            "browser ui",
+            "frontend",
+            "web app",
+            "web ui",
+        ),
     )
-    return browser_signal and interaction_signal
 
 
 def _matches_data_pipeline(ledger: SeedDraftLedger) -> bool:
