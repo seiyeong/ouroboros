@@ -402,10 +402,17 @@ def execution(
         print_error(f"Execution status failed: no persisted execution found: {execution_id}")
         raise typer.Exit(_STATUS_RUN_EXIT_UNKNOWN_RUN)
 
+    status_rows = sorted(
+        persisted,
+        key=lambda row: (
+            str(row["event_type"])
+            not in {"execution.terminal", "execution.completed", "execution.failed"}
+        ),
+    )
     status = next(
         (
             resolved
-            for row in persisted
+            for row in status_rows
             if (
                 resolved := _event_status(str(row["event_type"]), str(row["payload"]))
             )
